@@ -195,11 +195,120 @@ func (r *Replayer) replayTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 		BlockNumber: blk.BlockNumber(),
 	}
 
+	out := r.executeTx(db, blockCtx, gp, tx, txIdx)
+	if out.msgErr != nil {
+		res.Status = 2
+		res.Err = fmt.Sprintf("build message: %v", out.msgErr)
+		return res
+	}
+
+	// 串行语义收尾：状态合并（Finalise）→ MPT 提交（口径由 MPTPerTx 决定）→ receipt 构建
+	db.Finalise(true)
+
+	// MPT 树更新：
+	//   true  = 每笔交易 CommitMPT（pre-Byzantium 语义）
+	//   false = 区块结束时统一一次（现代主网语义），此处跳过，由 replayBlock 统一处理
+	if r.cfg.MPTPerTx {
+		mptStart := time.Now()
+		db.CommitMPT()
+		res.MptNs = time.Since(mptStart).Nanoseconds()
+	}
+
+	// receipt 构建：对齐链上 MakeReceipt 的 GetLogs + CreateBloom
+	recStart := time.Now()
+	_ = buildReceipt(blk, txIdx, db.Logs(), out.result, tx.Hash)
+	res.ReceiptNs = time.Since(recStart).Nanoseconds()
+
+	// 耗时 / 执行结果 / 读写集
+	fillExecOutcome(&res, out)
+
+	// 可选：与 dataset canonical / rwsets 对比
+	if r.cfg.Compare {
+		res.Compare = buildCompare(blk, txIdx, &res)
+	}
+	return res
+}
+
+// PreExecute 预执行一个区块的全部交易并采集读写集。
+//
+// 预执行语义：与串行 replayBlock 相反，每笔交易都基于同一份 witness
+// 初始状态（pre-first-user-tx 锚点）独立执行，交易之间互不干扰、互不影响，
+// 等价于把每笔交易都当作区块内第一笔来跑。
+//
+// 与串行执行的差异：
+//   - 状态：每笔交易 Clone 一份初始状态快照，执行完即弃（不累积、不依赖前序交易）；
+//   - GasPool：每笔交易独立满额（区块 gas limit）；
+//   - 不做 Finalise/CommitMPT/buildReceipt（串行链上语义的产物），
+//     MptNs/ReceiptNs 保持零值；
+//   - 读写集采集口径与串行完全一致（slot + balance + nonce，per-tx recorder）。
+//
+// 返回 []output.TxResult（与串行结果同构、顺序与交易原始顺序一一对应），
+// 便于直接对比串行/预执行的读写集差异（如冲突检测、乐观并发控制研究）。
+//
+// 当前为顺序调用，但每笔交易的 db/recorder 相互独立、无共享可变状态，
+// 天然可并行（为后续并发预执行实验留出余地）。
+func (r *Replayer) PreExecute(blk *dataset.BlockData) []output.TxResult {
+	// 基础状态：纯内存模式（无 trie，预执行只需读写集、无需真实 state root），
+	// witness 只灌一次，之后每笔交易从该快照克隆。
+	base := state.NewMemoryStateDBWithTrie(false)
+	loadWitness(base, &blk.Witness)
+
+	blockCtx := BuildBlockContext(&blk.Header, r.chainConfig)
+
+	results := make([]output.TxResult, 0, len(blk.Transactions))
+	for i := range blk.Transactions {
+		tx := &blk.Transactions[i]
+		res := output.TxResult{
+			TxHash:      common.HexToHash(tx.Hash),
+			TxIndex:     i,
+			BlockNumber: blk.BlockNumber(),
+		}
+
+		// 每笔交易：独立状态快照 + 独立满额 GasPool
+		db := base.Clone()
+		gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
+
+		out := r.executeTx(db, blockCtx, gp, tx, i)
+		if out.msgErr != nil {
+			res.Status = 2
+			res.Err = fmt.Sprintf("build message: %v", out.msgErr)
+			results = append(results, res)
+			continue
+		}
+
+		// 耗时 / 执行结果 / 读写集（不做任何串行收尾）
+		fillExecOutcome(&res, out)
+		results = append(results, res)
+	}
+	return results
+}
+
+// execOutcome 单笔交易执行核心（executeTx）的产出。
+type execOutcome struct {
+	msgErr   error                 // 消息构造失败（Status=2 路径）；非 nil 时其余字段无效
+	result   *core.ExecutionResult // 正式执行（最后一轮）的结果
+	execErr  error                 // core 级错误（nonce/余额不匹配等）
+	runs     []int64               // 各轮执行耗时
+	recorder *state.AccessRecorder // 最后一轮的读写集采集器（RecordRW=false 时为 nil）
+}
+
+// executeTx 单笔交易执行核心（串行 replayTx 与预执行 PreExecute 共用）：
+// 构造 msg → baseFee 对齐 → SetTxContext → 多 run ApplyMessage 计时
+// （含 recorder + FrameTracer 注入）。
+//
+// 语义：
+//   - Runs>1 时前 N-1 轮在快照上执行后回滚（仅计时），最后一轮正式执行；
+//   - 正式执行后扣减 *gp（多轮用副本避免重复扣减区块 gas）；
+//   - 不含串行语义的收尾（Finalise/CommitMPT/receipt），由调用方按需追加。
+func (r *Replayer) executeTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
+	gp *core.GasPool, tx *dataset.TxData, txIdx int) execOutcome {
+
+	var out execOutcome
+
 	msg, err := tx.ToMessage()
 	if err != nil {
-		res.Status = 2
-		res.Err = fmt.Sprintf("build message: %v", err)
-		return res
+		out.msgErr = err
+		return out
 	}
 	// 对齐 TransactionToMessage 的 baseFee 语义：
 	// GasPrice = min(GasTipCap + baseFee, GasFeeCap)
@@ -208,13 +317,7 @@ func (r *Replayer) replayTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 	}
 	db.SetTxContext(common.HexToHash(tx.Hash), txIdx)
 
-	runs := make([]int64, 0, r.cfg.Runs)
-	var (
-		finalResult *core.ExecutionResult
-		finalErr    error
-		recorder    *state.AccessRecorder
-	)
-
+	out.runs = make([]int64, 0, r.cfg.Runs)
 	for run := 0; run < r.cfg.Runs; run++ {
 		isLast := run == r.cfg.Runs-1
 
@@ -242,79 +345,59 @@ func (r *Replayer) replayTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 		snap := db.Snapshot()
 		start := time.Now()
 		result, execErr := core.ApplyMessage(evm, msg, &gpCopy)
-		runs = append(runs, time.Since(start).Nanoseconds())
+		out.runs = append(out.runs, time.Since(start).Nanoseconds())
 
 		if !isLast {
 			// 回滚到执行前，供下一次 run
 			db.RevertToSnapshot(snap)
 			continue
 		}
-		// 正式提交：状态变更保留，供同区块后续交易依赖
-		finalResult, finalErr = result, execErr
+		// 正式执行：结果与 GasPool 保留（状态收尾由调用方处理）
+		out.result, out.execErr = result, execErr
 		*gp = gpCopy
-		if result != nil && result.Err != nil {
-			// 交易失败（revert 等）：EVM 内部已回滚到 tx 快照
-		}
-		db.Finalise(true)
-
-		// MPT 树更新：口径由 cfg.MPTPerTx 决定。
-		//   true  = 每笔交易 CommitMPT（pre-Byzantium 语义）
-		//   false = 区块结束时统一一次（现代主网语义），此处跳过，由 replayBlock 统一处理
-		if r.cfg.MPTPerTx {
-			mptStart := time.Now()
-			db.CommitMPT()
-			res.MptNs = time.Since(mptStart).Nanoseconds()
-		}
-
-		// receipt 构建：对齐链上 MakeReceipt 的 GetLogs + CreateBloom
-		recStart := time.Now()
-		_ = buildReceipt(blk, txIdx, db.Logs(), finalResult, tx.Hash)
-		res.ReceiptNs = time.Since(recStart).Nanoseconds()
-
-		recorder = rec
+		out.recorder = rec
 	}
+	return out
+}
 
+// fillExecOutcome 将 executeTx 的产出填充进 TxResult 的公共字段
+// （耗时统计 / 执行结果判定 / 读写集提取），供串行与预执行共用。
+func fillExecOutcome(res *output.TxResult, out execOutcome) {
 	// 耗时统计
-	res.ElapsedNs = median(runs)
-	if len(runs) > 1 {
-		res.Runs = runs
+	res.ElapsedNs = median(out.runs)
+	if len(out.runs) > 1 {
+		res.Runs = out.runs
 	}
 
 	// 执行结果
-	if finalErr != nil {
+	if out.execErr != nil {
 		// core 级错误（nonce/余额不匹配等），TransitionDb 已内部回滚
 		res.Status = 0
-		res.Err = finalErr.Error()
-		if finalResult != nil {
-			res.GasUsed = finalResult.UsedGas
+		res.Err = out.execErr.Error()
+		if out.result != nil {
+			res.GasUsed = out.result.UsedGas
 		}
-	} else if finalResult != nil {
-		if finalResult.Failed() {
+	} else if out.result != nil {
+		if out.result.Failed() {
 			res.Status = 0
-			if finalResult.Err != nil {
-				res.Err = finalResult.Err.Error()
+			if out.result.Err != nil {
+				res.Err = out.result.Err.Error()
 			}
 		} else {
 			res.Status = 1
 		}
-		res.GasUsed = finalResult.UsedGas
+		res.GasUsed = out.result.UsedGas
 	}
 
 	// 读写集
-	if recorder != nil {
-		recorder.SetRootResult(res.GasUsed, res.Status == 0, res.Err)
-		recorder.Freeze()
-		res.CallTree = recorder.CallTree()
-		res.FlatReadKeys = recorder.FlatReadKeys()
-		res.FlatWriteKeys = recorder.FlatWriteKeys()
-		res.Stats = buildStats(recorder)
+	if out.recorder != nil {
+		out.recorder.SetRootResult(res.GasUsed, res.Status == 0, res.Err)
+		out.recorder.Freeze()
+		res.CallTree = out.recorder.CallTree()
+		res.FlatReadKeys = out.recorder.FlatReadKeys()
+		res.FlatWriteKeys = out.recorder.FlatWriteKeys()
+		res.Stats = buildStats(out.recorder)
 	}
-
-	// 可选：与 dataset canonical / rwsets 对比
-	if r.cfg.Compare {
-		res.Compare = buildCompare(blk, txIdx, &res)
-	}
-	return res
 }
 
 // loadWitness 将 dataset witness 灌入 MemoryStateDB。

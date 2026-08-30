@@ -78,6 +78,36 @@ func NewMemoryStateDBWithTrie(withTrie bool) *MemoryStateDB {
 	return s
 }
 
+// Clone 深拷贝当前状态库，返回一份独立快照（预执行用）。
+//
+// 克隆语义：
+//   - accounts 逐账户深拷贝（AccountState.clone），克隆库上的任何修改
+//     （含 journal 回滚、Finalise）都不会波及原库；
+//   - trieDB/stateTrie 共享引用：纯内存模式（NewMemoryStateDBWithTrie(false)，
+//     预执行默认）下均为 nil；带 trie 模式下 trie 节点不可变、共享只读安全，
+//     克隆库 CommitMPT 时写的是自己的 storageTrie/stateTrie 引用语义由
+//     AccountState.clone 保持一致（storageTrie 共享，写前需注意，见其注释）；
+//   - per-tx 运行态（journal/refund/logs/selfdestructed/transientStorage/
+//     访问列表/recorder）一律重置为干净初始，克隆库相当于「刚初始化完」。
+//
+// 典型用法：区块开始时 loadWitness 灌入基础库 base，之后每笔交易
+// db := base.Clone() 得到互不影响的独立状态执行。
+func (s *MemoryStateDB) Clone() *MemoryStateDB {
+	c := &MemoryStateDB{
+		trieDB:    s.trieDB,
+		stateTrie: s.stateTrie,
+	}
+	c.accounts = make(map[common.Address]*AccountState, len(s.accounts))
+	for addr, acc := range s.accounts {
+		c.accounts[addr] = acc.clone()
+	}
+	c.selfdestructed = make(map[common.Address]struct{})
+	c.transientStorage = make(map[common.Address]map[common.Hash]common.Hash)
+	c.accessAddrs = make(map[common.Address]struct{})
+	c.accessSlots = make(map[common.Address]map[common.Hash]struct{})
+	return c
+}
+
 // SetRecorder 注入本 tx 的采集器（每笔交易开始时调用；nil 表示不采集）。
 func (s *MemoryStateDB) SetRecorder(r *AccessRecorder) { s.recorder = r }
 

@@ -113,3 +113,32 @@ func (a *AccountState) finalise() {
 	a.touched = false
 	a.created = false
 }
+
+// clone 深拷贝账户状态（预执行的独立状态快照）。
+//
+// Balance/originBalance/Code/originStorage/dirtyStorage 逐项复制，
+// 保证克隆库上的任何修改（含 journal 回滚）都不会波及原库。
+// storageTrie 共享引用：纯内存模式（预执行默认）下恒为 nil；
+// 带 trie 模式下 trie 基于已 Commit 的 root 重建、写前不可变，共享只读安全。
+func (a *AccountState) clone() *AccountState {
+	c := &AccountState{
+		Balance:       new(uint256.Int).Set(a.Balance),
+		Nonce:         a.Nonce,
+		Code:          append([]byte(nil), a.Code...),
+		codeHash:      a.codeHash,
+		originBalance: new(uint256.Int).Set(a.originBalance),
+		originNonce:   a.originNonce,
+		storageTrie:   a.storageTrie,
+		touched:       a.touched,
+		created:       a.created,
+	}
+	c.originStorage = make(map[common.Hash]common.Hash, len(a.originStorage))
+	for k, v := range a.originStorage {
+		c.originStorage[k] = v
+	}
+	c.dirtyStorage = make(map[common.Hash]common.Hash, len(a.dirtyStorage))
+	for k, v := range a.dirtyStorage {
+		c.dirtyStorage[k] = v
+	}
+	return c
+}
