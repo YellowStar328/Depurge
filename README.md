@@ -181,7 +181,7 @@ Total elapsed     : 210.000ms
 
 ```
 Vegeta run | parallelism=10 edge-order=new serial-order=block filter-nonce=true filter-coinbase=true runs=5
-block 24000000: 232 txs | waves=18(max 144) | parallel=215 aborted=4 serial=17 | pre=17.912958ms order=378.7µs dag=167.933µs par=22.8591ms(clone 127.60149ms, merge 1.730192ms) ser=634.15µs | total=24.039883ms (excl. pre-exec) incl-pre=41.952841ms | state-diff=166
+block 24000000: 232 txs | waves=18(max 144) | parallel=215 aborted=4 serial=17 | pre=17.912958ms order=378.7µs dag=167.933µs par=22.8591ms(clone 127.60149ms, merge 1.730192ms) ser=634.15µs | total=24.039883ms (excl. pre-exec) incl-pre=41.952841ms | state-diff=166 | serialized-order=MATCH
   runs(n=5): 226.958541ms, 174.095542ms, 156.508541ms, 104.62675ms, 120.199416ms (avg 156.477758ms)
   abort: tx#231: nonce too high: ...
   diff: veg-only acct:0x...:balance
@@ -198,6 +198,7 @@ total (order+dag+parallel+serial) : 24.039883ms
 total incl. pre-exec              : 41.952841ms
 block-end MPT                     : 1.487375ms (excluded from total)
 state diff keys                   : 166 across all blocks
+serialized-order verification     : MATCH (diff keys 0, verified outside algo timing)
 -------------------------------------------------------------------
 ```
 
@@ -209,8 +210,19 @@ state diff keys                   : 166 across all blocks
 - `serial`：串行兜底重放
 - `total`：`order + dag + parallel + serial`（算法总时间，**不含预执行**）
 - `state diff keys`：最终状态与串行基线不一致的 key 数（正确性诊断，`veg-only`/`serial-only` 为差异样本）
+- `serialized-order`：合并提交层等价性验证（`MATCH`/`MISMATCH`，见下）
 
 其中 `clone` 为所有 worker 克隆耗时**之和**（总和口径），而 `parallel wall` 为并发覆盖后的墙钟（墙钟口径），故 `clone` 可能大于 `parallel wall`——这正是「全状态 Clone 实现最新视图」的实现开销，真实系统用 MVCC 规避。
+
+### 正确性诊断的双口径
+
+Vegeta 输出两类正确性诊断，分工不同：
+
+1. **`state-diff`**：vegeta 并发最终状态 vs **原始区块序串行基线**（链上正确状态）的差异。它回答「并发执行是否偏离链上正确状态」。`veg-only`/`serial-only` 是差异 key 样本。非零差异可能来自：预执行失败/空集交易、被过滤 key（nonce/coinbase balance）在读值上的隔离、以及乐观并发作废不级联的固有语义偏差。
+
+2. **`serialized-order`**：vegeta 并发最终状态 vs **按波次隔离串行重放**的差异。它回答「合并提交层（`MergeCommittedFrom` / coinbase tip 增量合并 / nonce 累加）是否与串行重放等价」。验证采用**按波次隔离**口径：每个波次内每笔交易基于「波次开始快照」独立执行（复刻并发读隔离），波内执行完按提交顺序合并——这样精确复刻「并发读隔离 + 顺序合并」，只测合并层，不混入读隔离偏差。`MATCH`（diff keys 0）表示合并层与串行等价。
+
+两类诊断共同作用：`state-diff` 测「偏离链上」、`serialized-order` 测「合并层是否等价」；前者非零是 vegeta 乐观并发的语义边界（预期内），后者非零才是合并实现的 bug。
 
 ## 并发控制科研用法
 

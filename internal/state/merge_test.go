@@ -15,7 +15,8 @@ func testAddr(s string) common.Address { return common.HexToAddress(s) }
 func u256v(v uint64) *uint256.Int { return uint256.NewInt(v) }
 
 // TestMergeCommittedFromFields 验证字段级合并语义：
-// storage 槽 / balance / nonce 按 src 最终值落 master，
+// storage 槽按 src 最终值落 master；balance 走覆盖（非 additive 时）；
+// nonce 走 +=1 累加（可交换计数器，单笔交易 delta 恒为 +1）。
 // 未在写集中的字段不受影响。
 func TestMergeCommittedFromFields(t *testing.T) {
 	addrA := testAddr("0x1111111111111111111111111111111111111111")
@@ -26,7 +27,7 @@ func TestMergeCommittedFromFields(t *testing.T) {
 	// 成员库：克隆后模拟交易执行（balance-10 / nonce+1 / 槽 k1 改值 / 新槽 k2）
 	src := master.Clone()
 	src.SubBalance(addrA, u256v(10), 0)
-	src.SetNonce(addrA, 6, 0)
+	src.SetNonce(addrA, 6, 0) // master@5 执行后 +1 = 6
 	src.SetState(addrA, common.Hash{1}, common.Hash{11})
 	src.SetState(addrA, common.Hash{2}, common.Hash{22})
 	src.Finalise(true)
@@ -44,14 +45,48 @@ func TestMergeCommittedFromFields(t *testing.T) {
 	if got := master.GetBalance(addrA); got.Cmp(u256v(90)) != 0 {
 		t.Fatalf("balance = %v, want 90", got)
 	}
+	// nonce +=1 累加：master@5 + 1 = 6（单笔交易，与覆盖结果一致）
 	if got := master.GetNonce(addrA); got != 6 {
-		t.Fatalf("nonce = %d, want 6", got)
+		t.Fatalf("nonce = %d, want 6 (master 5 += 1)", got)
 	}
 	if got := master.GetState(addrA, common.Hash{1}); got != (common.Hash{11}) {
 		t.Fatalf("slot1 = %v, want 11", got)
 	}
 	if got := master.GetState(addrA, common.Hash{2}); got != (common.Hash{22}) {
 		t.Fatalf("slot2 = %v, want 22", got)
+	}
+}
+
+// TestMergeCommittedFromNonceAccumulate 验证 nonce +=1 累加在并发场景的正确性：
+// 同一 sender 的两笔交易在同一波次并发执行（各自从相同基准 clone，
+// nonce 各自 +1 得相同值），依次合并必须累加（master +=1 两次）而非覆盖
+// （后者会用相同值覆盖丢失一次递增）。这是 serialized-order MISMATCH 的根因修复。
+func TestMergeCommittedFromNonceAccumulate(t *testing.T) {
+	sender := testAddr("0x5555555555555555555555555555555555555555")
+	master := NewMemoryStateDBWithTrie(false)
+	master.InitAccount(sender, u256v(1000), 100, nil, nil)
+
+	// 两个成员各自 clone（sender nonce=100），执行后 nonce 都=101（各自 +1）
+	m1 := master.Clone()
+	m1.SetNonce(sender, 101, 0)
+	m1.Finalise(true)
+	m2 := master.Clone()
+	m2.SetNonce(sender, 101, 0)
+	m2.Finalise(true)
+
+	wk := "acct:" + sender.String() + ":nonce"
+	if err := master.MergeCommittedFrom(m1, []string{wk}, nil); err != nil {
+		t.Fatalf("merge m1: %v", err)
+	}
+	if got := master.GetNonce(sender); got != 101 {
+		t.Fatalf("after m1: nonce = %d, want 101 (100 += 1)", got)
+	}
+	if err := master.MergeCommittedFrom(m2, []string{wk}, nil); err != nil {
+		t.Fatalf("merge m2: %v", err)
+	}
+	// 累加：101 += 1 = 102（覆盖语义会得 101，丢失第二次递增）
+	if got := master.GetNonce(sender); got != 102 {
+		t.Fatalf("after m2: nonce = %d, want 102 (101 += 1, accumulate not overwrite)", got)
 	}
 }
 

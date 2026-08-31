@@ -33,7 +33,7 @@ type AccountSnapshot struct {
 //     增量 delta 由调用方在成员执行时预计算（= 成员最终值 − 成员克隆时
 //     master 的值），不能在合并时用"src − 当前 master"重算——同批先合并的
 //     成员已推进 master，会污染增量；
-//   - acct:addr:nonce   → master 账户 Nonce = src 值；
+//   - acct:addr:nonce   → master 账户 Nonce += 1（可交换计数器累加，见下）；
 //   - code 写不被 recorder 记录（SetCode 无记录），以 codeHash 不一致兜底拷贝
 //     （覆盖新建合约与 metamorphic 场景）；
 //   - src 有而 master 无的账户（写集涉及或兜底扫描）→ 整账户深拷贝（合约创建）；
@@ -113,9 +113,17 @@ func (s *MemoryStateDB) MergeCommittedFrom(src *MemoryStateDB, writeKeys []strin
 					mAcc.Balance.Set(sAcc.Balance)
 				}
 			}
-			if _, ok := nonceAddrs[addr]; ok {
-				mAcc.Nonce = sAcc.Nonce
-			}
+		if _, ok := nonceAddrs[addr]; ok {
+			// nonce 是可交换计数器：每笔交易执行后 sender nonce 确定性 +1
+			//（StateTransition 在 evm.Call 之前 SetNonce(+1)，即使交易 revert
+			// 也不回滚；只有 preCheck 失败才不 +1，而那些交易不会进 merge）。
+			// 并发合并用「+=1 累加」而非覆盖，保证同 sender 多笔交易并发执行
+			// 时 nonce 正确递增——覆盖语义会因多成员各自从相同基准 clone +1
+			// 后覆盖合并而丢失递增（serialized-order MISMATCH 的根因）。
+			// 注意：EIP-7702 authority 的 SetNonce 是设到 auth.Nonce+1
+			// （特定值，非 +1 递增）；Prague 之前的 dataset 不涉及。
+			mAcc.Nonce += 1
+		}
 			// code 兜底：写集不含 code 写，以哈希不一致兜底
 			if mAcc.GetCodeHash() != sAcc.GetCodeHash() {
 				mAcc.Code = append([]byte(nil), sAcc.Code...)

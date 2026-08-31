@@ -113,6 +113,12 @@ type VegetaBlockResult struct {
 	StateDiffSample []string // 不一致 key 样本（前若干个）
 	FailSamples     []string // 验证失败原因样本（前若干个）
 	Warning         string   // 死锁防御触发等异常提示（空 = 无异常）
+
+	// 并发顺序串行化验证：把 vegeta 实际提交顺序（并行段提交顺序 + 串行兜底顺序）
+	// 串行重放一遍，与 vegeta 并发执行结果做 diff。仅验证、不计入算法耗时。
+	SerializedOrderMatch  bool     // 串行化重放结果是否与并发结果完全一致
+	SerializedDiffKeys    int      // 串行化 vs 并发的差异 key 数
+	SerializedDiffSample  []string // 差异 key 样本
 }
 
 const (
@@ -220,7 +226,10 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 	// ---- 阶段 4：按波次乐观并行验证 ----
 	// master 即基准状态库：预执行结束后 base 不再被并发读取；
 	// 波内仅只读（并发 Clone），波间串行合并提交。
+	// waveCommitted 记录每个波次 committed 交易的原始索引（波内按提交顺序），
+	// 用于"按波次隔离串行"验证（不计入算法耗时）：复刻并发读隔离 + 顺序合并。
 	master := base
+	waveCommitted := make([][]int, 0, 8)
 	parStart := time.Now()
 	for g.Pending() {
 		wave := g.Ready()
@@ -275,6 +284,7 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 			res.Committed++
 		}
 		res.MergeNs += time.Since(mergeStart).Nanoseconds()
+		waveCommitted = append(waveCommitted, committed)
 	}
 	res.ParallelWallNs = time.Since(parStart).Nanoseconds()
 
@@ -321,6 +331,26 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 		res.StateDiffSample = append(res.StateDiffSample, "serial-only "+k)
 	}
 
+	// ---- 并发顺序串行化验证（仅验证、不计入算法耗时）----
+	// 按波次隔离串行重放（复刻并发读隔离 + 顺序合并），与并发结果 master 做
+	// diff：验证合并提交层是否与"串行重放"等价。
+	serializedDb := r.vegetaSerializedOrderReplay(blk, blockCtx, waveCommitted, serialList, opts)
+	onlyConc, onlySer := state.DiffFlatStates(master.ExportFlatState(), serializedDb.ExportFlatState())
+	res.SerializedDiffKeys = len(onlyConc) + len(onlySer)
+	res.SerializedOrderMatch = res.SerializedDiffKeys == 0
+	for _, k := range onlyConc {
+		if len(res.SerializedDiffSample) >= stateDiffSampleLimit {
+			break
+		}
+		res.SerializedDiffSample = append(res.SerializedDiffSample, "concurrent-only "+k)
+	}
+	for _, k := range onlySer {
+		if len(res.SerializedDiffSample) >= stateDiffSampleLimit {
+			break
+		}
+		res.SerializedDiffSample = append(res.SerializedDiffSample, "serialized-only "+k)
+	}
+
 	// ---- 成本核算（仅统计各阶段耗时与总耗时，不计算 speedup）----
 	res.TotalAlgoNs = res.OrderNs + res.DagNs + res.ParallelWallNs + res.SerialWallNs
 	res.TotalInclPreNs = res.PreExecWallNs + res.TotalAlgoNs
@@ -356,6 +386,7 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 		blocks int
 		totals VegetaBlockResult
 	)
+	totals.SerializedOrderMatch = true // 汇总口径：全部区块 match 才为 match
 	err := r.loader.ForEachBlock(blockRange, func(blk *dataset.BlockData) error {
 		// 整区块多轮：取各轮耗时平均，正确性诊断以最后一轮为准（各轮确定性一致）。
 		res, perRun := r.runVegetaBlockRuns(blk, vcfg, runs)
@@ -365,13 +396,14 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 		line := fmt.Sprintf(
 			"block %d: %d txs | waves=%d(max %d) | parallel=%d aborted=%d serial=%d | "+
 				"pre=%s order=%s dag=%s par=%s(clone %s, merge %s) ser=%s | "+
-				"total=%s (excl. pre-exec) incl-pre=%s | state-diff=%d",
+				"total=%s (excl. pre-exec) incl-pre=%s | state-diff=%d | serialized-order=%s",
 			res.BlockNumber, res.TxCount, res.Waves, res.MaxWaveSize,
 			res.Committed, res.Aborted, res.SerialTotal,
 			time.Duration(res.PreExecWallNs), time.Duration(res.OrderNs), time.Duration(res.DagNs),
 			time.Duration(res.ParallelWallNs), time.Duration(res.CloneNs), time.Duration(res.MergeNs),
 			time.Duration(res.SerialWallNs),
-			time.Duration(res.TotalAlgoNs), time.Duration(res.TotalInclPreNs), res.StateDiffKeys)
+			time.Duration(res.TotalAlgoNs), time.Duration(res.TotalInclPreNs), res.StateDiffKeys,
+			serializedMatchLabel(res))
 		fmt.Fprintln(w, line)
 		if runs > 1 && len(perRun) > 0 {
 			fmt.Fprintf(w, "  runs(n=%d): %s\n", runs, formatRuns(perRun))
@@ -387,6 +419,9 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 		}
 		for _, s := range res.StateDiffSample {
 			fmt.Fprintf(w, "  diff: %s\n", s)
+		}
+		for _, s := range res.SerializedDiffSample {
+			fmt.Fprintf(w, "  serialized-diff: %s\n", s)
 		}
 		return nil
 	})
@@ -419,6 +454,8 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 	fmt.Fprintf(w, "total incl. pre-exec              : %s\n", time.Duration(totals.TotalInclPreNs))
 	fmt.Fprintf(w, "block-end MPT                     : %s (excluded from total)\n", time.Duration(totals.MptNs))
 	fmt.Fprintf(w, "state diff keys                   : %d across all blocks\n", totals.StateDiffKeys)
+	fmt.Fprintf(w, "serialized-order verification     : %s (diff keys %d, verified outside algo timing)\n",
+		serializedMatchLabel(&totals), totals.SerializedDiffKeys)
 	if totals.Degraded > 0 {
 		fmt.Fprintf(w, "WARNING           : %d txs degraded to serial by deadlock guard\n", totals.Degraded)
 	}
@@ -577,7 +614,7 @@ func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemorySta
 					db.Finalise(true)
 					oc.valid = true
 					oc.db = db
-					oc.writeKeys = rec.FlatWriteKeys() // 原始口径（nonce 写也需合并）
+					oc.writeKeys = rec.FlatWriteKeys() // 原始口径（含 nonce 写：nonce 走 +=1 累加合并）
 					if preAdditiveBalance != nil {
 						oc.additiveDeltas = map[common.Address]*big.Int{
 							cbAddr: new(big.Int).Sub(
@@ -591,6 +628,88 @@ func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemorySta
 	}
 	wg.Wait()
 	return outcomes
+}
+
+// vegetaSerializedOrderReplay 并发顺序串行化验证：在新鲜状态库上精确复刻
+// vegeta 并发执行的"读隔离 + 顺序合并"语义，验证合并提交层
+// （MergeCommittedFrom / additiveDeltas / nonce 累加）是否与串行重放等价。
+//
+// 口径：按波次分批。每个波次内，每笔交易基于"波次开始时的 db 快照"独立执行
+// （复刻并发时每笔 master.Clone() 的读隔离——同波交易互相不可见），波内全部
+// 执行完后按 committed 顺序 MergeCommittedFrom 合并进 db（复刻并发合并）。
+// 串行兜底段（serialList）在 db 上直接顺序执行（与并发串行段一致）。
+// nonce 口径逐笔匹配：并行段交易 skipNonce=true，串行兜底段 skipNonce=false。
+//
+// 本函数仅用于正确性验证，其耗时不计入算法总耗时。
+func (r *Replayer) vegetaSerializedOrderReplay(blk *dataset.BlockData, blockCtx vm.BlockContext,
+	waveCommitted [][]int, serialList []int, opts vegeta.Options) *state.MemoryStateDB {
+
+	db := state.NewMemoryStateDBWithTrie(false)
+	loadWitness(db, &blk.Witness)
+
+	var cbAddr common.Address
+	if opts.FilterCoinbase && opts.Coinbase != "" {
+		cbAddr = common.HexToAddress(opts.Coinbase)
+	}
+
+	// 并行段：按波次隔离串行（复刻并发读隔离 + 顺序合并）
+	for _, wave := range waveCommitted {
+		// 波次开始快照：本波所有交易的执行基准（复刻并发 master.Clone()）
+		waveSnapshot := db.Clone()
+
+		type mergeRec struct {
+			db            *state.MemoryStateDB
+			writeKeys     []string
+			additiveDeltas map[common.Address]*big.Int
+		}
+		recs := make([]mergeRec, 0, len(wave))
+
+		for _, idx := range wave {
+			member := waveSnapshot.Clone() // 每笔基于波次开始快照（同波隔离）
+			gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
+
+			var preAdditiveBalance *uint256.Int
+			if cbAddr != (common.Address{}) {
+				preAdditiveBalance = waveSnapshot.GetBalance(cbAddr)
+			}
+
+			out := r.executeTx(member, blockCtx, gp, &blk.Transactions[idx], idx, true)
+			if out.recorder != nil {
+				out.recorder.SetRootResult(out.result.UsedGas, false, "")
+				out.recorder.Freeze()
+			}
+			member.Finalise(true)
+
+			var deltas map[common.Address]*big.Int
+			if preAdditiveBalance != nil {
+				deltas = map[common.Address]*big.Int{
+					cbAddr: new(big.Int).Sub(
+						member.GetBalance(cbAddr).ToBig(),
+						preAdditiveBalance.ToBig()),
+				}
+			}
+			writeKeys := []string{}
+			if out.recorder != nil {
+				writeKeys = out.recorder.FlatWriteKeys()
+			}
+			recs = append(recs, mergeRec{db: member, writeKeys: writeKeys, additiveDeltas: deltas})
+		}
+
+		// 波内全部执行完，按提交顺序合并进 db（复刻并发合并）
+		for _, rec := range recs {
+			if err := db.MergeCommittedFrom(rec.db, rec.writeKeys, rec.additiveDeltas); err != nil {
+				panic(err) // 不应发生：与 vegeta 合并同口径
+			}
+		}
+	}
+
+	// 串行兜底段：直接顺序执行（与并发串行段一致）
+	gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
+	for _, idx := range serialList {
+		r.executeTx(db, blockCtx, gp, &blk.Transactions[idx], idx, false)
+		db.Finalise(true)
+	}
+	return db
 }
 
 // vegetaSerialBaseline 纯内存串行基线：与串行执行完全同口径
@@ -735,6 +854,10 @@ func accumulateVegetResult(totals *VegetaBlockResult, res *VegetaBlockResult) {
 	totals.BaselineWallNs += res.BaselineWallNs
 	totals.BaselineSumNs += res.BaselineSumNs
 	totals.StateDiffKeys += res.StateDiffKeys
+	totals.SerializedDiffKeys += res.SerializedDiffKeys
+	if !res.SerializedOrderMatch {
+		totals.SerializedOrderMatch = false
+	}
 }
 
 func pctOf(a, b int) float64 {
@@ -742,4 +865,13 @@ func pctOf(a, b int) float64 {
 		return 0
 	}
 	return float64(a) / float64(b) * 100
+}
+
+// serializedMatchLabel 返回并发顺序串行化验证的结论标签：
+// "MATCH"（串行化重放与并发结果完全一致）或 "MISMATCH"。
+func serializedMatchLabel(res *VegetaBlockResult) string {
+	if res.SerializedOrderMatch {
+		return "MATCH"
+	}
+	return "MISMATCH"
 }
