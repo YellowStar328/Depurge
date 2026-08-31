@@ -1,6 +1,6 @@
 // vegeta.go 实现 NSDI'25 论文 Vegeta（speculate-order-replay）的区块级编排：
 // 并行预执行猜保守读写集 → 依赖排序（贪心聚簇）→ 冲突 DAG → 按波次乐观并行
-// 验证（验证失败/级联作废回退串行）→ 串行兜底 → 成本核算与串行基线对比。
+// 验证（验证失败作废回退串行，不级联）→ 串行兜底 → 成本核算与串行基线对比。
 //
 // 状态口径（用户确认）：全程纯内存（NewMemoryStateDBWithTrie(false)），
 // 区块结束统一一次 MPT 提交（单独计时，不计入算法总时间）。
@@ -66,7 +66,7 @@ func (c VegetaConfig) normalize() VegetaConfig {
 // 交易去向（统计口径）。
 const (
 	TxOutcomeParallel = "parallel" // 波次并行验证通过并提交
-	TxOutcomeAborted  = "aborted"  // 验证失败作废（含级联）进串行段
+	TxOutcomeAborted  = "aborted"  // 验证失败作废（不级联后继）进串行段
 	TxOutcomeDirect   = "serial"   // 预执行失败/空集，直接进串行段
 )
 
@@ -80,8 +80,7 @@ type VegetaBlockResult struct {
 	PreExecFailed int // 预执行失败（msgErr/execErr/EVM 失败）
 	EmptyRWSet    int // 过滤 nonce 后读写集为空
 	Committed     int // 波次并行验证通过提交
-	Aborted       int // 验证失败作废（直接失败数，不含级联）
-	Cascaded      int // 因前驱作废被级联作废
+	Aborted       int // 验证失败作废（直接失败数；不级联作废后继）
 	SerialTotal   int // 串行兜底段交易总数
 	Degraded      int // 死锁防御兜底强制进串行段的交易数（正常为 0）
 	Waves         int // 波次数
@@ -226,7 +225,7 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 	for g.Pending() {
 		wave := g.Ready()
 		if len(wave) == 0 {
-			// 防御兜底：级联作废保证下理论不可达；剩余 pending 全部强制进串行段。
+			// 防御兜底：作废/提交均会释放后继入度，理论不可达；剩余 pending 强制进串行段。
 			remaining := g.Remaining()
 			res.Degraded = len(remaining)
 			res.Warning = fmt.Sprintf("波次死锁防御触发：%d 笔 pending 交易强制进入串行段", len(remaining))
@@ -246,8 +245,9 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 			res.CloneNs += oc.cloneNs
 		}
 
-		// 先判定本波全部作废者（含级联），再合并幸存者——
-		// 杜绝后继基于"前驱写入缺失"的视图提交。
+		// 先判定本波全部作废者，再合并幸存者。作废不级联后继：
+		// 后继继续在并行阶段执行（基于"前驱写入缺失"的视图），
+		// 最终状态不保证与串行完全一致，仅尽可能接近（确定性不受影响）。
 		var committed []int
 		byTx := make(map[int]*waveOutcome, len(outcomes))
 		for _, oc := range outcomes {
@@ -256,10 +256,8 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 				committed = append(committed, oc.txIdx)
 				continue
 			}
-			newly := g.Invalidate(oc.txIdx) // 级联全部 pending 后继
-			if len(newly) > 0 {
+			if len(g.Invalidate(oc.txIdx)) > 0 {
 				res.Aborted++
-				res.Cascaded += len(newly) - 1
 			}
 			if len(res.FailSamples) < failSampleLimit {
 				res.FailSamples = append(res.FailSamples, fmt.Sprintf("tx#%d: %s", oc.txIdx, oc.failReason))
@@ -281,7 +279,7 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 	res.ParallelWallNs = time.Since(parStart).Nanoseconds()
 
 	// ---- 阶段 5：串行重放兜底 ----
-	// 初始串行段（预执行失败/空集）+ 验证作废 + 级联作废；
+	// 初始串行段（预执行失败/空集）+ 验证作废（不级联）；
 	// block 序 = 与链上串行执行等价（用户确认口径）。
 	serialList := vegeta.SortSerial(append(g.Aborted(), directSerial...),
 		func(i int) string { return blk.Transactions[i].Hash }, opts)
@@ -365,11 +363,11 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 		accumulateVegetResult(&totals, res)
 
 		line := fmt.Sprintf(
-			"block %d: %d txs | waves=%d(max %d) | parallel=%d aborted=%d(+%d cascaded) serial=%d | "+
+			"block %d: %d txs | waves=%d(max %d) | parallel=%d aborted=%d serial=%d | "+
 				"pre=%s order=%s dag=%s par=%s(clone %s, merge %s) ser=%s | "+
 				"total=%s (excl. pre-exec) incl-pre=%s | state-diff=%d",
 			res.BlockNumber, res.TxCount, res.Waves, res.MaxWaveSize,
-			res.Committed, res.Aborted, res.Cascaded, res.SerialTotal,
+			res.Committed, res.Aborted, res.SerialTotal,
 			time.Duration(res.PreExecWallNs), time.Duration(res.OrderNs), time.Duration(res.DagNs),
 			time.Duration(res.ParallelWallNs), time.Duration(res.CloneNs), time.Duration(res.MergeNs),
 			time.Duration(res.SerialWallNs),
@@ -714,7 +712,6 @@ func accumulateVegetResult(totals *VegetaBlockResult, res *VegetaBlockResult) {
 	totals.EmptyRWSet += res.EmptyRWSet
 	totals.Committed += res.Committed
 	totals.Aborted += res.Aborted
-	totals.Cascaded += res.Cascaded
 	totals.SerialTotal += res.SerialTotal
 	totals.Degraded += res.Degraded
 	totals.Waves += res.Waves

@@ -181,7 +181,7 @@ Total elapsed     : 210.000ms
 
 ```
 Vegeta run | parallelism=10 edge-order=new serial-order=block filter-nonce=true filter-coinbase=true runs=5
-block 24000000: 232 txs | waves=18(max 144) | parallel=215 aborted=4(+8 cascaded) serial=17 | pre=17.912958ms order=378.7µs dag=167.933µs par=22.8591ms(clone 127.60149ms, merge 1.730192ms) ser=634.15µs | total=24.039883ms (excl. pre-exec) incl-pre=41.952841ms | state-diff=166
+block 24000000: 232 txs | waves=18(max 144) | parallel=215 aborted=4 serial=17 | pre=17.912958ms order=378.7µs dag=167.933µs par=22.8591ms(clone 127.60149ms, merge 1.730192ms) ser=634.15µs | total=24.039883ms (excl. pre-exec) incl-pre=41.952841ms | state-diff=166
   runs(n=5): 226.958541ms, 174.095542ms, 156.508541ms, 104.62675ms, 120.199416ms (avg 156.477758ms)
   abort: tx#231: nonce too high: ...
   diff: veg-only acct:0x...:balance

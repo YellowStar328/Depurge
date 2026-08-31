@@ -192,10 +192,12 @@ func TestWaves(t *testing.T) {
 	}
 }
 
-// TestInvalidateCascade 验证作废级联到全部 DAG 后继（传递闭包）。
+// TestInvalidateNoCascade 验证作废不级联：仅作废自身，并释放后继入度
+// （后继得以继续就绪，不再被作废前驱阻塞）。
 //
-// 菱形依赖：0→2、0→3、2→4、3→4。作废 0 应级联 {2,3,4}。
-func TestInvalidateCascade(t *testing.T) {
+// 菱形依赖：0→2、0→3、2→4、3→4。作废 0 只作废 {0}，后继 2/3 入度释放、
+// 4 仍等待 2/3（其入度由 2、3 各自处理后才归零）。
+func TestInvalidateNoCascade(t *testing.T) {
 	infos := []TxInfo{
 		{Index: 0, Writes: []string{"k"}},
 		{Index: 2, Writes: []string{"k"}},
@@ -203,36 +205,33 @@ func TestInvalidateCascade(t *testing.T) {
 		{Index: 4, Writes: []string{"k"}},
 		{Index: 9, Reads: []string{"other"}},
 	}
-	// 聚簇序按索引即可；k 上全写者：0→2→3→4
+	// 聚簇序按索引即可；k 上全写者：0→2、0→3、2→4、3→4
 	g := BuildGraph([]int{0, 2, 3, 4, 9}, infos, DefaultOptions())
 
 	newly := g.Invalidate(0)
-	if !reflect.DeepEqual(newly, []int{0, 2, 3, 4}) {
-		t.Fatalf("newly aborted = %v, want [0 2 3 4]", newly)
+	if !reflect.DeepEqual(newly, []int{0}) {
+		t.Fatalf("newly aborted = %v, want [0]", newly)
 	}
-	// tx9 无冲突不受级联影响，仍就绪
-	if ready := g.Ready(); !reflect.DeepEqual(ready, []int{9}) {
-		t.Fatalf("ready = %v, want [9]", ready)
+	if g.AbortedCount() != 1 {
+		t.Fatalf("aborted = %d, want 1（仅 tx0，不级联）", g.AbortedCount())
 	}
-	g.Commit(9)
-	if g.Pending() {
-		t.Fatal("after commit(9) no pending tx should remain")
-	}
-	if g.AbortedCount() != 4 {
-		t.Fatalf("aborted = %d, want 4", g.AbortedCount())
+	// 作废 0 后：仅 0 的直接后继 {2,3,4} 入度各 -1。2 的入度归零就绪；
+	// 3 仍等 2（入度 1）、4 仍等 2 与 3（入度 2），9 无冲突就绪。
+	if ready := g.Ready(); !reflect.DeepEqual(ready, []int{2, 9}) {
+		t.Fatalf("ready after invalidate(0) = %v, want [2 9]", ready)
 	}
 	// 重复作废为 no-op
 	if again := g.Invalidate(0); again != nil {
 		t.Fatalf("re-invalidate = %v, want nil", again)
 	}
-	// 提交已作废交易为 no-op（已提交的仍只有 tx9）
-	g.Commit(2)
-	if g.CommittedCount() != 1 {
-		t.Fatalf("committed = %d, want 1（仅 tx9）", g.CommittedCount())
+	// 提交已作废交易为 no-op
+	g.Commit(0)
+	if g.CommittedCount() != 0 {
+		t.Fatalf("committed = %d, want 0", g.CommittedCount())
 	}
 }
 
-// TestInvalidateAfterPartialCommit 验证部分前驱已提交时作废只级联可达后继。
+// TestInvalidateAfterPartialCommit 验证部分前驱已提交时作废只作废自身并释放后继。
 func TestInvalidateAfterPartialCommit(t *testing.T) {
 	infos := []TxInfo{
 		{Index: 0, Writes: []string{"ka"}},
@@ -251,11 +250,15 @@ func TestInvalidateAfterPartialCommit(t *testing.T) {
 	if ready := g.Ready(); !reflect.DeepEqual(ready, []int{2}) {
 		t.Fatalf("ready = %v, want [2]", ready)
 	}
-	// 作废 2：级联其后继 3（3 不得在 2 缺席时并行提交）
+	// 作废 2：只作废 {2}，并释放后继 3 的入度（3 变就绪，不再被 2 阻塞）
 	newly := g.Invalidate(2)
-	if !reflect.DeepEqual(newly, []int{2, 3}) {
-		t.Fatalf("newly = %v, want [2 3]", newly)
+	if !reflect.DeepEqual(newly, []int{2}) {
+		t.Fatalf("newly = %v, want [2]", newly)
 	}
+	if ready := g.Ready(); !reflect.DeepEqual(ready, []int{3}) {
+		t.Fatalf("ready after invalidate(2) = %v, want [3]", ready)
+	}
+	g.Commit(3)
 	if g.Pending() {
 		t.Fatal("no pending tx should remain")
 	}

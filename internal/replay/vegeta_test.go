@@ -13,7 +13,7 @@ import (
 //
 // 守恒不变量：
 //   - Committed + SerialTotal == TxCount（每笔交易要么并行验证提交，要么进串行兜底）；
-//   - PreExecFailed + EmptyRWSet + Aborted + Cascaded + Committed + Degraded == TxCount；
+//   - PreExecFailed + EmptyRWSet + Aborted + Committed + Degraded == TxCount；
 //   - Degraded == 0（波次死锁防御不应触发）。
 //
 // dataset 路径可用 -dataset 覆盖，默认使用仓库内 datasets/test-24000000-24000009；
@@ -49,22 +49,22 @@ func TestVegetaBlockEndToEnd(t *testing.T) {
 			t.Errorf("block %d: committed(%d)+serial(%d) != txs(%d)",
 				blockNum, res.Committed, res.SerialTotal, res.TxCount)
 		}
-		if got := res.PreExecFailed + res.EmptyRWSet + res.Aborted + res.Cascaded + res.Committed + res.Degraded; got != res.TxCount {
+		if got := res.PreExecFailed + res.EmptyRWSet + res.Aborted + res.Committed + res.Degraded; got != res.TxCount {
 			t.Errorf("block %d: outcome partition sums to %d, want %d", blockNum, got, res.TxCount)
 		}
 		if res.Degraded != 0 {
 			t.Errorf("block %d: deadlock guard triggered: %s", blockNum, res.Warning)
 		}
 
-		t.Logf("block %d: %d txs | waves=%d(max %d) | parallel=%d aborted=%d(+%d) serial=%d | "+
+		t.Logf("block %d: %d txs | waves=%d(max %d) | parallel=%d aborted=%d serial=%d | "+
 			"pre=%s order=%s dag=%s par=%s(clone %s, merge %s) ser=%s | algo=%s incl-pre=%s | "+
-			"baseline=%s speedup=%.2f | state-diff=%d",
+			"state-diff=%d",
 			blockNum, res.TxCount, res.Waves, res.MaxWaveSize,
-			res.Committed, res.Aborted, res.Cascaded, res.SerialTotal,
+			res.Committed, res.Aborted, res.SerialTotal,
 			nsDur(res.PreExecWallNs), nsDur(res.OrderNs), nsDur(res.DagNs),
 			nsDur(res.ParallelWallNs), nsDur(res.CloneNs), nsDur(res.MergeNs),
 			nsDur(res.SerialWallNs), nsDur(res.TotalAlgoNs), nsDur(res.TotalInclPreNs),
-			nsDur(res.BaselineWallNs), res.Speedup, res.StateDiffKeys)
+			res.StateDiffKeys)
 		if res.Warning != "" {
 			t.Logf("  WARNING: %s", res.Warning)
 		}

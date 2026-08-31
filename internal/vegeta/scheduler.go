@@ -2,7 +2,7 @@
 // Execution in Leaderless Blockchains》speculate-order-replay 框架的纯调度逻辑：
 //
 //	依赖排序（按 key 贪心聚簇）→ 冲突依赖 DAG（写写/读写/写读三类冲突）→
-//	波次状态机（就绪 / 提交 / 作废级联）→ 串行兜底列表排序。
+//	波次状态机（就绪 / 提交 / 作废不级联）→ 串行兜底列表排序。
 //
 // 本包只做集合与图运算，不依赖 EVM / dataset / state，可独立单元测试；
 // 预执行（用真实 EVM 在基准状态上猜测保守读写集）由 internal/replay 集成层完成。
@@ -209,8 +209,9 @@ const (
 //   - EdgeOrderOriginal：一律按原始区块序定向（保证最终状态与链上串行等价）。
 //
 // 状态机：Ready() 返回所有入度为 0 的 pending 交易组成一个波次；
-// 验证通过调用 Commit（后继入度减一）；验证失败调用 Invalidate（级联作废
-// 全部后继，后继不得基于前驱写入缺失的视图并行提交）。
+// 验证通过调用 Commit（后继入度减一）；验证失败调用 Invalidate（仅作废自身，
+// 后继入度减一——后继仍继续并行执行，基于前驱写入缺失的视图，最终状态仅
+// 尽可能接近串行、不保证完全一致）。
 type Graph struct {
 	infos map[int]TxInfo
 	pos   map[int]int   // 原始索引 -> 聚簇序位置
@@ -218,7 +219,7 @@ type Graph struct {
 	indeg map[int]int   // 原始索引 -> 剩余入度
 	state map[int]txState
 
-	aborted []int // 作废交易（含级联，按作废发生顺序）
+	aborted []int // 作废交易（不级联，按作废发生顺序）
 	edges   int
 }
 
@@ -359,29 +360,25 @@ func (g *Graph) Commit(idx int) {
 	}
 }
 
-// Invalidate 作废一笔交易（验证失败）并级联作废其全部 DAG 后继（传递闭包）。
+// Invalidate 作废一笔交易（验证失败），不级联作废其后继。
 //
-// 级联的必要性：前驱被作废后推迟到最后的串行兜底段，其后继若仍在并行阶段
-// 基于"前驱写入缺失"的视图执行并提交，会得到与链上不一致的状态——
-// 因此后继必须一并作废进串行段。返回本次新作废的原始索引（含 idx 自身）。
+// 作废的后继处理：前驱被作废后推迟到串行兜底段，其后继仍继续在并行阶段
+// 执行——因此对本作废的后继入度减一，视同前驱已离开 DAG、不再阻塞后继
+// （与 Commit 对称）。后继会基于"前驱写入缺失"的视图执行并提交，最终状态
+// 不再保证与串行完全一致，仅尽可能接近；但整个流程无随机性，相同输入必得
+// 相同输出（确定性由调度确定性保证）。返回本次新作废的原始索引（仅 idx 自身）。
 func (g *Graph) Invalidate(idx int) []int {
 	if g.state[idx] != statePending {
 		return nil
 	}
-	var newly []int
-	queue := []int{idx}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if g.state[cur] != statePending {
-			continue
+	g.state[idx] = stateAborted
+	g.aborted = append(g.aborted, idx)
+	for _, s := range g.succs[idx] {
+		if g.state[s] == statePending {
+			g.indeg[s]--
 		}
-		g.state[cur] = stateAborted
-		g.aborted = append(g.aborted, cur)
-		newly = append(newly, cur)
-		queue = append(queue, g.succs[cur]...)
 	}
-	return newly
+	return []int{idx}
 }
 
 // Pending 是否仍有 pending 交易（波次循环是否继续）。
@@ -395,7 +392,7 @@ func (g *Graph) Pending() bool {
 }
 
 // Remaining 返回全部 pending 交易的原始索引（升序）。
-// 正常流程不会用到（级联作废保证 pending 交易要么就绪要么被级联作废），
+// 正常流程不会用到（提交/作废均释放后继入度，pending 交易最终必就绪），
 // 仅供集成层做死锁防御兜底。
 func (g *Graph) Remaining() []int {
 	var out []int
@@ -408,7 +405,7 @@ func (g *Graph) Remaining() []int {
 	return out
 }
 
-// Aborted 返回全部作废交易的原始索引（含级联，按作废发生顺序）。
+// Aborted 返回全部作废交易的原始索引（不级联，按作废发生顺序）。
 // 串行兜底列表 = Aborted() + 初始串行段（预执行失败/空集交易，图外），
 // 统一经 SortSerial 排序。
 func (g *Graph) Aborted() []int {
