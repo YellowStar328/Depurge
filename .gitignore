@@ -37,6 +37,7 @@ datasets/
 
 # 运行产物（重放概要日志）
 run-summary.log
+*.log
 
 # IDE / 项目数据
 .codebuddy/
