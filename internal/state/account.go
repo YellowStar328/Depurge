@@ -14,9 +14,9 @@ var emptyCodeHash = crypto.Keccak256Hash(nil)
 // originStorage / originBalance / originNonce 表示本区块 witness（或上一笔交易
 // Finalise 提交后）的已提交值；修改先写当前值，Finalise 时合并回 origin。
 type AccountState struct {
-	Balance *uint256.Int
-	Nonce   uint64
-	Code    []byte
+	Balance  *uint256.Int
+	Nonce    uint64
+	Code     []byte
 	codeHash common.Hash // 惰性计算缓存；零值表示未计算
 
 	originBalance *uint256.Int

@@ -6,8 +6,8 @@ import (
 	"bufio"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math/big"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -27,10 +27,10 @@ import (
 
 // Config 重放配置。
 type Config struct {
-	Runs       int  // 每笔交易执行次数（>1 时输出各次耗时与中位数）
-	RecordRW   bool // 是否采集读写集（false = 纯性能基准）
-	Compare    bool // 是否与 dataset canonical/rwsets 对比
-	MPTPerTx   bool // MPT 提交口径：true=每笔交易 CommitMPT（pre-Byzantium 语义）；false=区块结束统一一次（现代主网语义）
+	Runs        int  // 每笔交易执行次数（>1 时输出各次耗时与中位数）
+	RecordRW    bool // 是否采集读写集（false = 纯性能基准）
+	Compare     bool // 是否与 dataset canonical/rwsets 对比
+	MPTPerTx    bool // MPT 提交口径：true=每笔交易 CommitMPT（pre-Byzantium 语义）；false=区块结束统一一次（现代主网语义）
 	StateConfig state.Config
 }
 
@@ -81,13 +81,10 @@ func NewReplayer(loader *dataset.Loader, cfg Config) *Replayer {
 }
 
 // Run 流式重放指定区块范围并输出结果。
-func (r *Replayer) Run(w *output.Writer, blockRange string) error {
-	// 运行概要写入根目录 run-summary.log（覆盖写）
-	sum, err := os.OpenFile("run-summary.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("open run-summary.log: %w", err)
+func (r *Replayer) RunSerial(w *output.Writer, sum io.Writer, blockRange string, runs int) error {
+	if runs < 1 {
+		runs = 1
 	}
-	defer sum.Close()
 	bw := bufio.NewWriter(sum)
 	defer bw.Flush()
 
@@ -99,10 +96,11 @@ func (r *Replayer) Run(w *output.Writer, blockRange string) error {
 	// 文件头
 	fmt.Fprintf(bw, "Replay started at: %s\n", startTime.Format(time.RFC3339))
 	fmt.Fprintf(bw, "%s\n", sep)
-	fmt.Fprintf(bw, ">>> Replay Depurge <<<\n")
+	fmt.Fprintf(bw, ">>> Replay Serial <<<\n")
 	if r.loader.Manifest != nil {
 		fmt.Fprintf(bw, "Dataset range    : %d - %d\n", r.loader.Manifest.FromBlock, r.loader.Manifest.ToBlock)
 	}
+	fmt.Fprintf(bw, "runs             : %d (per-block pipeline rounds, averaged)\n", runs)
 	fmt.Fprintf(bw, "%s\n", sub)
 
 	var (
@@ -110,19 +108,33 @@ func (r *Replayer) Run(w *output.Writer, blockRange string) error {
 		totalMptNs     int64 // MPT 树更新
 		totalReceiptNs int64 // receipt 构建
 	)
-	err = r.loader.ForEachBlock(blockRange, func(blk *dataset.BlockData) error {
-		results := r.replayBlock(blk)
+	err := r.loader.ForEachBlock(blockRange, func(blk *dataset.BlockData) error {
+		// 每区块跑 runs 轮，三段耗时取平均；JSONL 只写最后一轮（确定性一致）。
+		var blockSerialNs, blockMptNs, blockReceiptNs int64
+		var results []output.TxResult
+		for run := 0; run < runs; run++ {
+			res := r.replayBlock(blk)
+			var s, m, rc int64
+			for i := range res {
+				s += res[i].ElapsedNs
+				m += res[i].MptNs
+				rc += res[i].ReceiptNs
+			}
+			blockSerialNs += s
+			blockMptNs += m
+			blockReceiptNs += rc
+			if run == runs-1 {
+				results = res
+			}
+		}
+		blockSerialNs /= int64(runs)
+		blockMptNs /= int64(runs)
+		blockReceiptNs /= int64(runs)
+
 		if err := w.WriteBlock(blk.BlockNumber(), results); err != nil {
 			return err
 		}
 
-		// 累加该区块三段耗时
-		var blockSerialNs, blockMptNs, blockReceiptNs int64
-		for i := range results {
-			blockSerialNs += results[i].ElapsedNs
-			blockMptNs += results[i].MptNs
-			blockReceiptNs += results[i].ReceiptNs
-		}
 		totalSerialNs += blockSerialNs
 		totalMptNs += blockMptNs
 		totalReceiptNs += blockReceiptNs
@@ -195,7 +207,7 @@ func (r *Replayer) replayTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 		BlockNumber: blk.BlockNumber(),
 	}
 
-	out := r.executeTx(db, blockCtx, gp, tx, txIdx)
+	out := r.executeTx(db, blockCtx, gp, tx, txIdx, false)
 	if out.msgErr != nil {
 		res.Status = 2
 		res.Err = fmt.Sprintf("build message: %v", out.msgErr)
@@ -268,7 +280,7 @@ func (r *Replayer) PreExecute(blk *dataset.BlockData) []output.TxResult {
 		db := base.Clone()
 		gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
 
-		out := r.executeTx(db, blockCtx, gp, tx, i)
+		out := r.executeTx(db, blockCtx, gp, tx, i, true)
 		if out.msgErr != nil {
 			res.Status = 2
 			res.Err = fmt.Sprintf("build message: %v", out.msgErr)
@@ -301,7 +313,7 @@ type execOutcome struct {
 //   - 正式执行后扣减 *gp（多轮用副本避免重复扣减区块 gas）；
 //   - 不含串行语义的收尾（Finalise/CommitMPT/receipt），由调用方按需追加。
 func (r *Replayer) executeTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
-	gp *core.GasPool, tx *dataset.TxData, txIdx int) execOutcome {
+	gp *core.GasPool, tx *dataset.TxData, txIdx int, skipNonce bool) execOutcome {
 
 	var out execOutcome
 
@@ -309,6 +321,12 @@ func (r *Replayer) executeTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 	if err != nil {
 		out.msgErr = err
 		return out
+	}
+	// 预执行路径（skipNonce=true）：跳过 nonce 校验，避免同一地址多笔交易
+	// 因 witness 初始 nonce 固定而触发 ErrNonceTooHigh/TooLow 导致预执行失败。
+	// 串行执行仍保留 nonce 校验，与链上语义一致。
+	if skipNonce {
+		msg.SkipNonceChecks = true
 	}
 	// 对齐 TransactionToMessage 的 baseFee 语义：
 	// GasPrice = min(GasTipCap + baseFee, GasFeeCap)

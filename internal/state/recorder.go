@@ -42,11 +42,11 @@ func DefaultConfig() Config {
 type AccessRecorder struct {
 	cfg Config
 
-	root    *CallFrame            // 顶层帧（tx 级，depth=0）
-	stack   []*CallFrame          // 当前调用栈（栈顶 = 当前帧）
-	frames  []*CallFrame          // 全部帧（按创建顺序）
-	cur     *CallFrame            // 当前帧缓存（避免重复索引栈顶）
-	entries int                   // 总访问条数
+	root    *CallFrame   // 顶层帧（tx 级，depth=0）
+	stack   []*CallFrame // 当前调用栈（栈顶 = 当前帧）
+	frames  []*CallFrame // 全部帧（按创建顺序）
+	cur     *CallFrame   // 当前帧缓存（避免重复索引栈顶）
+	entries int          // 总访问条数
 
 	flatRead  map[string]struct{} // 扁平读 key 去重
 	flatWrite map[string]struct{} // 扁平写 key 去重

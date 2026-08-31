@@ -7,18 +7,18 @@ import (
 
 // BlockHeader 对齐 dataset 区块 JSON 的 header 字段。
 type BlockHeader struct {
-	BaseFeePerGas *Big    `json:"baseFeePerGas"`
-	Beneficiary   string  `json:"beneficiary"` // coinbase，hex 地址字符串
-	BlobGasUsed   U64     `json:"blobGasUsed"`
-	Difficulty    *Big    `json:"difficulty"`
-	ExcessBlobGas U64     `json:"excessBlobGas"`
-	GasLimit      U64     `json:"gasLimit"`
-	Hash          string  `json:"hash"`
-	Nonce         string  `json:"nonce"`
-	Number        U64     `json:"number"`
-	ParentHash    string  `json:"parentHash"`
-	PrevRandao    string  `json:"prevRandao"`
-	Timestamp     U64     `json:"timestamp"`
+	BaseFeePerGas *Big   `json:"baseFeePerGas"`
+	Beneficiary   string `json:"beneficiary"` // coinbase，hex 地址字符串
+	BlobGasUsed   U64    `json:"blobGasUsed"`
+	Difficulty    *Big   `json:"difficulty"`
+	ExcessBlobGas U64    `json:"excessBlobGas"`
+	GasLimit      U64    `json:"gasLimit"`
+	Hash          string `json:"hash"`
+	Nonce         string `json:"nonce"`
+	Number        U64    `json:"number"`
+	ParentHash    string `json:"parentHash"`
+	PrevRandao    string `json:"prevRandao"`
+	Timestamp     U64    `json:"timestamp"`
 }
 
 // BlockData 是单个区块文件（解压后 JSON）的顶层结构。

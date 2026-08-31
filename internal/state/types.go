@@ -64,9 +64,9 @@ type AccessEntry struct {
 	FrameID  string         `json:"frame_id"`
 	Address  common.Address `json:"address"`
 	Kind     AccessKind     `json:"kind"`
-	Slot     common.Hash    `json:"slot,omitempty"`              // 仅 storage 有效
-	Value    common.Hash    `json:"value"`                       // 读值或写入新值
-	OldValue common.Hash    `json:"old_value,omitempty"`         // 仅 write 有效
+	Slot     common.Hash    `json:"slot,omitempty"`      // 仅 storage 有效
+	Value    common.Hash    `json:"value"`               // 读值或写入新值
+	OldValue common.Hash    `json:"old_value,omitempty"` // 仅 write 有效
 	OpType   OpType         `json:"op_type"`
 }
 
