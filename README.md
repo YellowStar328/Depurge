@@ -66,6 +66,81 @@ go build -o depurge ./cmd/depurge
   --filter-nonce --filter-coinbase --runs 5
 ```
 
+### 预执行 vs 串行执行读写集差异（`TestPreExecuteVsSerialRWSet`）
+
+对比同一区块在两种执行模式下的每笔交易读写集差异（`internal/replay/preexec_test.go`）：
+
+- **串行**：`replayBlock`，交易共享状态，前一笔的提交影响后一笔。
+- **预执行**：`PreExecute`，每笔交易从同一份 witness 初始状态独立执行（独立快照 + 独立满额 GasPool + 跳过 nonce 校验）。
+
+对每笔交易做 `FlatReadKeys` / `FlatWriteKeys` 的集合差运算，输出：
+- `serial-only`：仅串行执行读到/写到的 key
+- `pre-only`：仅预执行读到/写到的 key
+
+每笔差异交易最多展示 10 个 key（`maxKeysShown`），并按区块与全局汇总不一致交易数。
+
+```bash
+# 默认 dataset（datasets/test-24000000-24000009），全部区块
+go test ./internal/replay/ -run TestPreExecuteVsSerialRWSet -v
+
+# 指定 dataset 与区块范围（注意 -args 之后的 flag 传给测试二进制）
+go test ./internal/replay/ -run TestPreExecuteVsSerialRWSet -v \
+  -args -dataset datasets/mainnet-21498532-21499531 -blocks 21498532-21498541
+```
+
+测试 flag：`-dataset`（默认 `../../datasets/test-24000000-24000009`）、`-blocks`（如 `24000001-24000003` 或单个块号，空则全部）。读写集采集口径与主流程一致（同一套 `AccessRecorder`：slot + balance + nonce）。
+
+### LLM 读写集 soundness 评测（`llmsoundness`）
+
+独立工具（`cmd/llmsoundness` + `internal/llmsoundness`），用 dataset 自带的 **canonical rwsets**
+（链上真实读写，ground truth）评测 `llm/mainnet_rw/` 里 **LLM 静态分析**产出的读写集的保守度：
+
+- **recall（召回）**：canonical 实际访问的 storage key，有多少被 LLM 声明覆盖。`1-recall = 漏报率`。
+- **precision（精确）**：LLM 声明的 key，有多少实际被访问。`1-precision = 多报率`。
+
+LLM 分析以抽象声明 `(account, field)` 给出（如 `{account:"msg.sender", field:"balances"}`）。
+评测核心是把抽象声明**实例化**成具体 slot key（`slot:<lower-addr>:<slot>`，与 dataset 对齐），
+再与 canonical 做集合对比。实例化支持：
+
+- **嵌套 mapping 链式解析**：LLM 对同一 field 按 key 层级「由外到内」输出多条记录，按 mapping
+  深度分块、逐块链式计算 `keccak(pad(k_i) || pad(prev))`（如 USDT `allowed[from][msg.sender]`）。
+- **struct 展开**：mapping/inplace 命中 struct 时，展开全部成员 word slot（去重）。
+- **原始类型兜底**：`t_bool`/`t_uintN`/`t_address` 等原始标量常不出现在 types 表，按 base slot 发。
+- 仅解析 `t_address` 类型的 key；非地址 key（tokenId/poolId 等）静态不可知，记 `dynamic-key` unresolved。
+
+```bash
+go run ./cmd/llmsoundness \
+  --llm-dir llm/mainnet_rw \
+  --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532-21498541
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--llm-dir` | `llm/mainnet_rw` | LLM 分析目录（每合约一个子目录） |
+| `--dataset` | （必填） | dataset 目录（提供 canonical rwsets） |
+| `--blocks` | 全部 | 区块范围，如 `21498532-21498541` |
+| `--min-tx` | `0` | 只报命中交易数 ≥ N 的合约 |
+
+**双口径指标**：报告同时给出「全部合约」与「仅带 storage 布局」两套全局指标。缺 `storage.json`
+的合约所有 field 都无法实例化（必然全漏报），单列以免拉低整体解读；逐合约表有 `sto` 列标记。
+
+**unresolved 分类**：`unknown-field`（LLM 声明的 field 不在 storage 布局，含把函数名当 field 的
+幻觉）、`unknown-type`、`dynamic-key`（key 静态不可知，如 tokenId）、`partial-chain`（嵌套 mapping
+欠声明，只给了部分层级的 key）。
+
+**已知限制**（属静态分析 + LLM 输出格式的本质边界，非实现 bug）：
+
+- 动态 key（`_positions[tokenId]` 的 tokenId、poolId 等）无法静态解析 → 漏报。典型如 NPM。
+- LLM 对 nested mapping 欠声明（只给外层 key，如 WBTC `allowed`）→ `partial-chain` 漏报。
+- `multicall` 的 LLM 分析是内层调用的保守并集且全标 `global` → 大量 `dynamic-key`/`partial-chain`。
+- precision 偏低多为**保守过近似**：LLM 按源码声明了 `paused`/`deprecated` 等读，但具体执行路径
+  未触发（实测 USDT extra 集中于这类，slot 实例化本身正确）。
+- `owner`/`params.*`/`opInfo.*` 等 account 符号暂不解析（需运行时状态或 struct 参数解码，收益低）。
+
+单元测试 `internal/llmsoundness/instance_test.go` 锁定链式 slot、struct 展开、原始类型兜底、
+非地址 key 四个关键行为。
+
 ### CLI 参数
 
 | 参数 | 默认 | 说明 |

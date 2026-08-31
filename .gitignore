@@ -34,6 +34,7 @@ datasets/
 
 # 编译产物
 /depurge
+/llmsoundness
 
 # 运行产物（重放概要日志）
 run-summary.log
