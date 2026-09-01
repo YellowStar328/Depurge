@@ -510,6 +510,10 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 	}
 
 	// ---- step4：串行兜底（直接串行 + abort + 防御兜底，按最初顺序）----
+	// 并行段已结束、无存活子库观察者：关闭 CoW（epoch 归零），串行段
+	// 写全部原地进行，免账户级/槽级物化税；下一区块 CloneCoW 重新发号自愈。
+	master.DisableCoW()
+
 	// sched.Aborted() 已含防御兜底交易；与 directSerial 不相交。
 	serialList := append([]int{}, directSerial...)
 	serialList = append(serialList, sched.Aborted()...)
@@ -565,6 +569,11 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 // depurgeExecOne worker 执行单笔就绪交易：克隆已提交状态 → 执行 →
 // spec⊇real 超集验证。克隆在读锁下（可并行），合并由 dispatcher 写锁串行。
 // 与预执行/波次验证同口径：skipNonce=true、每笔满额 GasPool。
+//
+// 克隆用 CloneCoW（账户级+槽级 CoW 惰性克隆）：浅拷贝 accounts map，
+// 真正写时才物化被写账户——单笔克隆成本从全量深拷贝降为 O(账户数) 指针
+// 复制。快照语义不变：克隆时点即「看到所有已提交前驱结果」的隔离视图，
+// 此后 master 的合并经 epoch 物化绝不触碰本库观察过的账户。
 func (r *Replayer) depurgeExecOne(blk *dataset.BlockData, master *state.MemoryStateDB,
 	masterMu *sync.RWMutex, blockCtx vm.BlockContext, job depurgeJob,
 	opts vegeta.Options) depurgeExecResult {
@@ -573,15 +582,17 @@ func (r *Replayer) depurgeExecOne(blk *dataset.BlockData, master *state.MemorySt
 
 	masterMu.RLock()
 	cloneStart := time.Now()
-	db := master.Clone()
+	db := master.CloneCoW()
 	er.cloneNs = time.Since(cloneStart).Nanoseconds()
 	// 记录可交换累加地址（coinbase）在克隆时点的基准余额：
 	// 验证通过后 delta = 成员最终值 − 该基准（MergeCommittedFrom 增量契约）。
+	// 必须立即值拷贝：GetBalance 返回 master 内部账户的指针，RUnlock 后
+	// 其他交易的合并会原地累加该余额，持引用跨锁会读到被污染的值。
 	var cbAddr common.Address
 	var preAdditiveBalance *uint256.Int
 	if opts.FilterCoinbase && opts.Coinbase != "" {
 		cbAddr = common.HexToAddress(opts.Coinbase)
-		preAdditiveBalance = master.GetBalance(cbAddr)
+		preAdditiveBalance = new(uint256.Int).Set(master.GetBalance(cbAddr))
 	}
 	masterMu.RUnlock()
 

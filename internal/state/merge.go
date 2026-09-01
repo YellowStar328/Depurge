@@ -78,7 +78,7 @@ func (s *MemoryStateDB) MergeCommittedFrom(src *MemoryStateDB, writeKeys []strin
 	// src = master 克隆 + 成员执行，故 src 有而 master 无的账户必为成员新建。
 	for addr, sAcc := range src.accounts {
 		if _, ok := s.accounts[addr]; !ok {
-			s.accounts[addr] = sAcc.clone()
+			s.adoptAccount(addr, sAcc.clone())
 		}
 	}
 
@@ -89,11 +89,15 @@ func (s *MemoryStateDB) MergeCommittedFrom(src *MemoryStateDB, writeKeys []strin
 		switch {
 		case sOk && !mOk:
 			// 成员新建的账户：整账户深拷贝（Finalise 后 touched/created 已复位）
-			s.accounts[addr] = sAcc.clone()
+			s.adoptAccount(addr, sAcc.clone())
 		case !sOk && mOk:
 			// 成员删除的账户（Finalise 的 EIP-158 / 自毁删除）
 			delete(s.accounts, addr)
 		case sOk && mOk:
+			// CoW 物化：master 可能仍有存活的 CloneCoW 子库观察着该账户
+			//（depurge 并行阶段），原地改会污染子库快照；epoch 不匹配时
+			// 先替换为私有副本再改。深拷贝路径（epoch=0）恒 no-op。
+			mAcc = s.cowEnsureAccount(addr)
 			if _, ok := balanceAddrs[addr]; ok {
 				if delta, add := additiveDeltas[addr]; add {
 					// 可交换累加（coinbase tip）：master += 调用方预计算的增量。
@@ -142,9 +146,13 @@ func (s *MemoryStateDB) MergeCommittedFrom(src *MemoryStateDB, writeKeys []strin
 		mAcc, mOk := s.accounts[sk.addr]
 		if !mOk {
 			// master 缺账户：整账户拷贝补齐（正常不会走到——账户级合并已处理）
-			s.accounts[sk.addr] = sAcc.clone()
+			s.adoptAccount(sk.addr, sAcc.clone())
 			continue
 		}
+		// CoW 物化（账户级 + 槽级）：originStorage 可能与存活子库共享，
+		// 原地写单槽前必须整 map 私有化。深拷贝路径（epoch=0）恒 no-op。
+		mAcc = s.cowEnsureAccount(sk.addr)
+		s.cowEnsureOrigin(mAcc)
 		mAcc.originStorage[sk.slot] = sAcc.GetState(sk.slot)
 	}
 	return nil

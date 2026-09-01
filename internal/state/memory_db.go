@@ -1,12 +1,15 @@
 package state
 
 import (
+	"sync/atomic"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	gethstate "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -51,6 +54,11 @@ type MemoryStateDB struct {
 	// trieDB 为共享的节点数据库，trieDB 为 nil 时关闭 MPT（纯内存模式，root 恒为零）。
 	trieDB    *triedb.Database
 	stateTrie *trie.Trie
+
+	// CoW epoch（原子访问：多 worker 并发 CloneCoW 同一父库时会写）：
+	// 0 = CoW 禁用（深拷贝 Clone / vegeta / 串行等常规路径，零额外开销）；
+	// 非 0 = CloneCoW 活跃，写入口须先物化共享账户（协议见 cow.go）。
+	epoch atomic.Uint64
 }
 
 type revertFunc func()
@@ -131,7 +139,7 @@ func (s *MemoryStateDB) InitAccount(addr common.Address, balance *uint256.Int, n
 		root, _ := st.Commit(false)
 		st, _ = trie.New(trie.StorageTrieID(types.EmptyRootHash, common.BytesToHash(addr[:]), root), s.trieDB)
 	}
-	s.accounts[addr] = NewAccountState(balance, nonce, code, storage, st)
+	s.adoptAccount(addr, NewAccountState(balance, nonce, code, storage, st))
 }
 
 // AccountCount 返回账户总数。
@@ -153,15 +161,17 @@ func (s *MemoryStateDB) getAccount(addr common.Address) *AccountState {
 // 该语义对齐 dataset rwsets：对不存在账户的写访问（如 CreateAccount、
 // 向 coinbase 转 tip）会先产生一条 balance 读。
 func (s *MemoryStateDB) getOrCreateForWrite(addr common.Address) *AccountState {
-	if acc, ok := s.accounts[addr]; ok {
-		return acc
+	if _, ok := s.accounts[addr]; ok {
+		// 账户级 CoW：epoch 不匹配（与其他库共享）则先物化再写；
+		// epoch=0 的深拷贝/常规路径恒 no-op。
+		return s.cowEnsureAccount(addr)
 	}
 	var st *trie.Trie
 	if s.trieDB != nil {
 		st = trie.NewEmpty(s.trieDB)
 	}
 	acc := NewAccountState(new(uint256.Int), 0, nil, nil, st)
-	s.accounts[addr] = acc
+	s.adoptAccount(addr, acc)
 	s.recorder.RecordBalanceRead(addr, common.Hash{})
 	s.journalAppend(func() { delete(s.accounts, addr) })
 	return acc
@@ -260,7 +270,7 @@ func (s *MemoryStateDB) SetCode(addr common.Address, code []byte) []byte {
 		acc.codeHash = oldHash
 	})
 	acc.Code = code
-	acc.codeHash = common.Hash{} // 重置缓存，惰性重算
+	acc.codeHash = crypto.Keccak256Hash(code) // 急算：读路径必须纯读（共享账户并发读）
 	acc.touched = true
 	return oldCode
 }
@@ -570,6 +580,15 @@ func (s *MemoryStateDB) Finalise(deleteEmptyObjects bool) {
 			if deleteEmptyObjects && acc.IsEmpty() {
 				delete(s.accounts, addr)
 				continue
+			}
+			// finalise 会原地写账户（dirty → origin 合并）：先确保账户私有。
+			// 正常路径下 touched 账户必经写入口已物化，此处为防御性兜底
+			//（覆盖「克隆时账户已 touched」的边界）；epoch=0 时恒 no-op。
+			acc = s.cowEnsureAccount(addr)
+			// 槽级 CoW：仅当确有 dirty 槽要并入 origin 时才拷贝 origin map
+			//（dirty 为空时 finalise 对 originStorage 无原地写，可免拷贝）。
+			if len(acc.dirtyStorage) > 0 {
+				s.cowEnsureOrigin(acc)
 			}
 			acc.finalise()
 		}
