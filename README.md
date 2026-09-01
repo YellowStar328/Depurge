@@ -9,7 +9,7 @@
 - **深层嵌套调用树**：追踪 CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2 全部子调用，读写集按 `frame_id` 父子关联组织为 `call_tree`，支持子调用级冲突分析。
 - **per-tx 无锁 Recorder**：每笔交易独立 Recorder 实例，交易结束 Freeze，天然无竞争，不污染并发实验加速比。
 - **双轨输出**：`call_tree`（树形，并发研究核心）+ `flat_rwset`（对齐 dataset 自带 rwsets，baseline 对比）。
-- **耗时精确记录**：纳秒级 EVM 执行打点，支持 `--runs N` 每区块整管线多轮运行取平均（串行与 Vegeta 共用，摊平测量噪声）。
+- **耗时精确记录**：纳秒级 EVM 执行打点，支持 `--runs N` 每区块整管线多轮运行取平均（串行 / Vegeta / Depurge 共用，摊平测量噪声）。
 - **真 MPT 树**：可选挂载 go-ethereum 真 trie，在每笔交易/区块结束时重算 state root 与 storage root，真实模拟链上 MPT 树更新开销。
 - **链上三段耗时**：每笔交易分别计时 EVM 执行（`ApplyMessage`）、MPT 树更新（`CommitMPT`）、receipt 构建（`GetLogs` + `CreateBloom`），支持与链上完整耗时口径对比。
 
@@ -26,7 +26,7 @@ go build -o depurge ./cmd/depurge
 ### 串行重放（`--replay-serial`）
 
 ```bash
-# 重放整个 dataset（默认同时运行串行与 vegeta，见算法开关）
+# 重放整个 dataset（默认同时运行串行与 vegeta；depurge 默认关闭，见算法开关）
 ./depurge replay --dataset datasets/test-24000000-24000009
 
 # 只跑串行执行算法
@@ -37,7 +37,7 @@ go build -o depurge ./cmd/depurge
 ./depurge replay --dataset datasets/test-24000000-24000009 \
   --blocks 24000000-24000002 --compare
 
-# 每区块整管线多轮运行取平均（串行与 vegeta 共用，摊平测量噪声）
+# 每区块整管线多轮运行取平均（串行 / vegeta / depurge 共用，摊平测量噪声）
 ./depurge replay --dataset datasets/test-24000000-24000009 \
   --blocks 24000000 --runs 5
 
@@ -64,6 +64,46 @@ go build -o depurge ./cmd/depurge
   --blocks 24000000 --replay-serial=false \
   --parallelism 10 --edge-order new --serial-order block \
   --filter-nonce --filter-coinbase --runs 5
+```
+
+### Depurge 并行执行（`--replay-depurge`）
+
+针对 Vegeta 两大缺点的改进算法：①预执行读写集偏移 → abort → 串行退化；②波次调度的
+straggler（慢交易拖整波）。算法四步：
+
+1. **step1 保守读写集获取（三臂）**：为每笔交易获取 `spec_rw`，获取失败或为空的交易进 step4。
+2. **step2 建图**：以读写集 key 为队列，交易按原始序入队（不区分读/写集）。
+3. **step3 事件驱动并行**：交易在其所有相关 key 队列都处于队头时就绪，多个就绪交易并行执行
+   （**无波次屏障**，提交即解锁后继，慢交易只拖其后继不拖无关交易）。执行得到真实读写集
+   `real_rw`，须满足 `spec_rw ⊇ real_rw` 才可提交，否则 abort。队列中 B 在 A 之后，则 B
+   必然看到 A 提交后的状态（B 解锁时 A 已合并进共享状态）。
+4. **step4 串行兜底**：step1 失败/空集 + abort 的交易，按原始序基于并行提交后的状态串行执行。
+
+三臂（`--spec-arm`）决定 step1 的读写集来源：
+
+| 臂 | 策略 | 说明 |
+|----|------|------|
+| `A` | LLM 优先 + 回退 | LLM 静态分析成功的交易用 LLM 集调度，失败的回退预执行集 |
+| `B` | 并集 | 预执行读写集 ∪ LLM 读写集（LLM 失败则仅预执行） |
+| `C` | 纯预执行（默认） | 等价于 vegeta 的读写集来源，对照组 |
+
+A/B 臂依赖 `llm/mainnet_rw`（`--llm-dir`）。LLM 只产 storage slot，桥接层会统一 key 格式
+（`slot:<小写>:<slot>` → recorder 的 `storage:<EIP-55>:<slot>`）并合成 sender balance key
+（gas 真实调度键）。LLM 失败逐类统计：`not-contract`（EOA 调用）/`no-contract`（无分析）/
+`no-selector`/`decode-fail`/`no-storage`（缺 storage 布局）/`unresolved`（含动态键）/`empty`。
+
+```bash
+# 只跑 Depurge（C 臂 = 纯预执行读写集）
+./depurge replay --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532-21498536 --replay-serial=false --replay-vegeta=false --replay-depurge
+
+# A 臂（LLM 优先 + 回退）与 B 臂（并集）
+./depurge replay --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532-21498536 --replay-depurge --spec-arm A --llm-dir llm/mainnet_rw
+
+# 三算法同跑（串行 → vegeta → depurge），多轮取平均
+./depurge replay --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532 --replay-depurge --spec-arm B --runs 5
 ```
 
 ### 预执行 vs 串行执行读写集差异（`TestPreExecuteVsSerialRWSet`）
@@ -150,18 +190,21 @@ go run ./cmd/llmsoundness \
 | `--blocks` | 全部 | 区块范围，如 `24000000-24000005` |
 | `--replay-serial` | `true` | 是否运行串行执行算法（EVM/MPT/receipt 耗时） |
 | `--replay-vegeta` | `true` | 是否运行 Vegeta 并行算法（各阶段耗时 + state-diff） |
-| `--runs` | `1` | 每区块整管线重复轮数，串行与 vegeta 共用（>1 取平均） |
+| `--replay-depurge` | `false` | 是否运行 Depurge 并行算法（事件驱动调度 + state-diff） |
+| `--spec-arm` | `C` | Depurge step1 读写集获取臂：`A`=LLM 优先+回退；`B`=并集；`C`=纯预执行 |
+| `--llm-dir` | `llm/mainnet_rw` | Depurge A/B 臂的 LLM 静态分析目录 |
+| `--runs` | `1` | 每区块整管线重复轮数，串行 / vegeta / depurge 共用（>1 取平均） |
 | `--compare` | `false` | 与 dataset 自带 canonical/rwsets 对比 |
 | `--no-record` | `false` | 跳过读写集采集（纯性能基准） |
 | `--rwset-granularity` | `slot` | 读写集粒度：`slot` / `account` |
 | `--collect-balance` | `true` | 是否采集 balance 读写 |
 | `--collect-nonce` | `true` | 是否采集 nonce 读写 |
 | `--mpt-per-tx` | `false` | MPT 提交口径：`true`=每笔交易提交（pre-Byzantium）；`false`=区块结束统一一次（现代主网语义） |
-| `--parallelism` | `0`（=NumCPU） | Vegeta worker 数（预执行与波次验证共用） |
+| `--parallelism` | `0`（=NumCPU） | worker 数，vegeta（预执行与波次验证）与 depurge（预执行与事件驱动调度）共用 |
 | `--edge-order` | `new` | Vegeta DAG 冲突边定向：`new`=聚簇序；`original`=原始区块序 |
 | `--serial-order` | `block` | Vegeta 串行兜底顺序：`block`=原始区块序；`hash`=交易哈希字典序 |
-| `--filter-nonce` | `true` | Vegeta 聚簇/建边/验证时过滤 nonce 伪冲突 key |
-| `--filter-coinbase` | `true` | Vegeta 过滤 coinbase 的 balance tip 写 key |
+| `--filter-nonce` | `true` | 建图/验证时过滤 nonce 伪冲突 key（vegeta 与 depurge 共用） |
+| `--filter-coinbase` | `true` | 过滤 coinbase 的 balance tip 写 key（vegeta 与 depurge 共用） |
 
 ## Dataset 格式
 
@@ -226,7 +269,7 @@ go run ./cmd/llmsoundness \
 
 ## 运行概要（run-summary.log）
 
-执行命令时会在当前目录（cwd）**覆盖写** `run-summary.log`；命令内按开关依次运行的多个算法（串行 → vegeta）**追加写**到同一文件。
+执行命令时会在当前目录（cwd）**覆盖写** `run-summary.log`；命令内按开关依次运行的多个算法（串行 → vegeta → depurge）**追加写**到同一文件，算法间以 `====` 分隔、每算法以 `>>> Replay <名字> <<<` 为标题。
 
 ### 串行算法输出（`--replay-serial`）
 
@@ -288,6 +331,49 @@ serialized-order verification     : MATCH (diff keys 0, verified outside algo ti
 - `serialized-order`：合并提交层等价性验证（`MATCH`/`MISMATCH`，见下）
 
 其中 `clone` 为所有 worker 克隆耗时**之和**（总和口径），而 `parallel wall` 为并发覆盖后的墙钟（墙钟口径），故 `clone` 可能大于 `parallel wall`——这正是「全状态 Clone 实现最新视图」的实现开销，真实系统用 MVCC 规避。
+
+### Depurge 算法输出（`--replay-depurge`）
+
+```
+>>> Replay Depurge <<<
+Depurge run | arm=C parallelism=10 runs=1
+block 21498532: 151 txs | sched=145 committed=144 aborted=1 serial=7 | spec=46.47075ms graph=109.542µs par=118.628042ms(clone 489.770374ms, merge 104.860377ms) ser=2.178208ms | total=120.915792ms (excl. spec) incl-spec=167.386542ms | state-diff=2 | reexec=0.7% par-avg=53.01 peak=82
+  abort: tx#1: rw-set violation: [storage:0x...:0x... ...]
+  diff: depurge-only acct:0x...:balance
+-------------------------------------------------------------------
+blocks=2 txs=299 | committed=287 (96.0%) aborted=3 serial=12 (4.0%)
+re-execution rate: 1.03% (aborted 3 / scheduled 290)
+spec acquisition: no-rwset=9 empty-spec=0
+LLM analysis (arm A): tried=781 ok=77 | fail: not-contract=0 no-contract=573 no-selector=0 decode-fail=0 no-storage=67 unresolved=63 empty=1
+phase timing:
+  spec      : wall=72.673417ms (excluded from total; pre-exec sum=105.580245ms)
+  graph     : 208.292µs
+  parallel  : wall=162.521542ms sum=64.88024ms (clone=618.90525ms merge=137.182337ms) avg-par=51.89 peak=95 dispatches=105
+  serial    : wall=2.960375ms sum=2.872209ms
+-------------------------------------------------------------------
+total (graph+parallel+serial) : 165.690209ms
+total incl. spec              : 238.363626ms
+block-end MPT                 : 2.9ms (excluded from total)
+state diff keys               : 8 across all blocks
+speedup                       : 0.29x (baseline wall 48.5ms / total 165.7ms)
+-------------------------------------------------------------------
+```
+
+阶段与指标含义：
+- `spec`：step1 保守读写集获取（预执行 + A/B 臂的 LLM 实例化），**不计入总耗时**；`pre-exec sum` 为预执行各交易耗时之和
+- `graph`：step2 key 队列建图
+- `parallel`：step3 事件驱动并行（`clone`/`merge` 为克隆/合并分项；`avg-par` 为平均并行度=在飞交易数对时间的积分/墙钟；`peak` 为峰值在飞数；`dispatches` 为就绪调度次数）
+- `serial`：step4 串行兜底（含 step1 失败/空集 + abort 交易）
+- `total`：`graph + parallel + serial`（算法总时间，**不含 spec 获取**；`incl-spec` 为含 spec 口径）
+- `re-execution rate`（重执行率）：`aborted / (committed + aborted)`，即参与调度交易中被作废的比例（对应 vegeta 缺点①的度量）
+- `spec acquisition`：`no-rwset`=预执行失败（无读写集）、`empty-spec`=过滤后空集，两者直接进串行兜底，不计入重执行率
+- `LLM analysis`：仅 A/B 臂输出，`tried`/`ok` 与逐类失败统计
+- `state diff keys`：最终状态与原始顺序串行基线的差异 key 数（`depurge-only`/`serial-only` 为样本），口径与含义同 vegeta 的 `state-diff`
+- `speedup`：串行基线墙钟 / 算法总耗时
+
+与 vegeta 的对照：两者共用预执行、过滤口径（`--filter-nonce`/`--filter-coinbase`）、合并层
+（nonce +=1 累加、coinbase tip 增量）与 state-diff 基准，差异仅在读写集来源（三臂）与调度方式
+（事件驱动无屏障 vs 波次屏障），便于隔离归因加速比变化。
 
 ### 正确性诊断的双口径
 

@@ -2,7 +2,7 @@
 //
 // 从 dataset 目录读取区块（header + transactions + witness），
 // 在基于 go-ethereum core/vm 的内存 EVM 中重放交易，采集执行耗时与
-// slot 级读写集。支持两种算法（--replay-serial / --replay-vegeta），
+// slot 级读写集。支持三种算法（--replay-serial / --replay-vegeta / --replay-depurge），
 // 结果统一写入根目录 run-summary.log：每次命令覆盖写，命令内多算法依次追加写。
 package main
 
@@ -33,8 +33,9 @@ func main() {
 		mptPerTx       bool
 
 		// 算法选择开关
-		replaySerial bool
-		replayVegeta bool
+		replaySerial  bool
+		replayVegeta  bool
+		replayDepurge bool
 
 		// vegeta 专属
 		vParallelism    int
@@ -42,6 +43,10 @@ func main() {
 		vSerialOrder    string
 		vFilterNonce    bool
 		vFilterCoinbase bool
+
+		// depurge 专属
+		dArm    string
+		dLLMDir string
 	)
 
 	rootCmd := &cobra.Command{
@@ -51,13 +56,13 @@ func main() {
 
 	replayCmd := &cobra.Command{
 		Use:   "replay",
-		Short: "重放 dataset 交易：串行执行（--replay-serial）与 Vegeta 并行（--replay-vegeta）",
+		Short: "重放 dataset 交易：串行（--replay-serial）、Vegeta 并行（--replay-vegeta）、Depurge 并行（--replay-depurge）",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if datasetDir == "" {
 				return fmt.Errorf("--dataset is required")
 			}
-			if !replaySerial && !replayVegeta {
-				return fmt.Errorf("no algorithm selected: enable --replay-serial and/or --replay-vegeta")
+			if !replaySerial && !replayVegeta && !replayDepurge {
+				return fmt.Errorf("no algorithm selected: enable --replay-serial and/or --replay-vegeta and/or --replay-depurge")
 			}
 			loader, err := dataset.NewLoader(datasetDir)
 			if err != nil {
@@ -124,6 +129,24 @@ func main() {
 					return err
 				}
 			}
+
+			// 3) Depurge 并行算法（三臂 spec_rw + key 队列事件驱动调度 + state-diff）
+			if replayDepurge {
+				dcfg := replay.DepurgeConfig{
+					Arm:            dArm,
+					LLMDir:         dLLMDir,
+					Parallelism:    vParallelism,
+					FilterNonce:    vFilterNonce,
+					FilterCoinbase: vFilterCoinbase,
+					StateConfig:    cfg.StateConfig,
+				}
+				fmt.Printf("depurge depurge: dataset=%s blocks=%s runs=%d parallelism=%s spec-arm=%s filter-nonce=%v filter-coinbase=%v\n",
+					datasetDir, blocksOrAll(blocks), runs, parallelismOrAuto(vParallelism),
+					dArm, vFilterNonce, vFilterCoinbase)
+				if err := r.RunDepurge(dcfg, blocks, runs, f); err != nil {
+					return err
+				}
+			}
 			return nil
 		},
 	}
@@ -140,13 +163,17 @@ func main() {
 
 	replayCmd.Flags().BoolVar(&replaySerial, "replay-serial", true, "运行串行执行算法（EVM/MPT/receipt 耗时）")
 	replayCmd.Flags().BoolVar(&replayVegeta, "replay-vegeta", true, "运行 Vegeta 并行算法（各阶段耗时 + state-diff）")
+	replayCmd.Flags().BoolVar(&replayDepurge, "replay-depurge", false, "运行 Depurge 并行算法（三臂 spec_rw + key 队列事件驱动调度 + state-diff）")
 
-	replayCmd.Flags().IntVar(&vParallelism, "parallelism", 0, "vegeta worker 数（<=0 = runtime.NumCPU()）")
+	replayCmd.Flags().IntVar(&vParallelism, "parallelism", 0, "vegeta/depurge worker 数（<=0 = runtime.NumCPU()）")
 	replayCmd.Flags().StringVar(&vEdgeOrder, "edge-order", "new", "vegeta DAG 冲突边定向：new=聚簇序；original=原始区块序")
 	replayCmd.Flags().StringVar(&vSerialOrder, "serial-order", "block", "vegeta 串行兜底顺序：block=原始区块序；hash=交易哈希字典序")
-	replayCmd.Flags().BoolVar(&vFilterNonce, "filter-nonce", true, "vegeta 聚簇/建边/验证时过滤 nonce 伪冲突 key")
-	replayCmd.Flags().BoolVar(&vFilterCoinbase, "filter-coinbase", true, "vegeta 过滤 coinbase 的 balance tip 写 key")
-	replayCmd.Flags().IntVar(&runs, "runs", 1, "每区块整管线重复轮数，串行与 vegeta 共用（>1 取平均，减少测量噪声）")
+	replayCmd.Flags().BoolVar(&vFilterNonce, "filter-nonce", true, "vegeta/depurge 聚簇/建边/验证时过滤 nonce 伪冲突 key")
+	replayCmd.Flags().BoolVar(&vFilterCoinbase, "filter-coinbase", true, "vegeta/depurge 过滤 coinbase 的 balance tip 写 key")
+
+	replayCmd.Flags().StringVar(&dArm, "spec-arm", "C", "depurge step1 读写集获取臂：A=LLM 优先+回退；B=并集；C=纯预执行")
+	replayCmd.Flags().StringVar(&dLLMDir, "llm-dir", "llm/mainnet_rw", "depurge A/B 臂的 LLM 静态分析数据目录")
+	replayCmd.Flags().IntVar(&runs, "runs", 1, "每区块整管线重复轮数，串行/vegeta/depurge 共用（>1 取平均，减少测量噪声）")
 
 	rootCmd.AddCommand(replayCmd)
 	if err := rootCmd.Execute(); err != nil {
