@@ -787,23 +787,33 @@ func (r *Replayer) runVegetaBlockRuns(blk *dataset.BlockData, vcfg VegetaConfig,
 // 去向统计/诊断字段取最后一轮（确定性一致）。
 func averageVegetaBlockResults(blockNum uint64, results []*VegetaBlockResult) *VegetaBlockResult {
 	n := int64(len(results))
-	avg := *results[len(results)-1] // 诊断字段取最后一轮
+	avg := *results[len(results)-1] // 计数/诊断字段取最后一轮
 	avg.BlockNumber = blockNum
-	avg.WitnessLoadNs /= n
-	avg.PreExecWallNs /= n
-	avg.PreExecSumNs /= n
-	avg.OrderNs /= n
-	avg.DagNs /= n
-	avg.ParallelWallNs /= n
-	avg.ParallelSumNs /= n
-	avg.CloneNs /= n
-	avg.MergeNs /= n
-	avg.SerialWallNs /= n
-	avg.SerialSumNs /= n
-	avg.MptNs /= n
-	avg.BaselineWallNs /= n
-	avg.BaselineSumNs /= n
-	// 派生字段重算（不能简单除，需基于平均后的基础值）
+	// 耗时字段 = 各轮求和 ÷ 轮数（与 averageDepurgeBlockResults 同口径）。
+	// 注意不能只取最后一轮再除 n：vegeta 各轮耗时并非逐位一致，
+	// 旧实现会把 runs>1 的耗时整体低估约 n 倍。
+	sum := func(get func(*VegetaBlockResult) int64) int64 {
+		var t int64
+		for _, r := range results {
+			t += get(r)
+		}
+		return t / n
+	}
+	avg.WitnessLoadNs = sum(func(r *VegetaBlockResult) int64 { return r.WitnessLoadNs })
+	avg.PreExecWallNs = sum(func(r *VegetaBlockResult) int64 { return r.PreExecWallNs })
+	avg.PreExecSumNs = sum(func(r *VegetaBlockResult) int64 { return r.PreExecSumNs })
+	avg.OrderNs = sum(func(r *VegetaBlockResult) int64 { return r.OrderNs })
+	avg.DagNs = sum(func(r *VegetaBlockResult) int64 { return r.DagNs })
+	avg.ParallelWallNs = sum(func(r *VegetaBlockResult) int64 { return r.ParallelWallNs })
+	avg.ParallelSumNs = sum(func(r *VegetaBlockResult) int64 { return r.ParallelSumNs })
+	avg.CloneNs = sum(func(r *VegetaBlockResult) int64 { return r.CloneNs })
+	avg.MergeNs = sum(func(r *VegetaBlockResult) int64 { return r.MergeNs })
+	avg.SerialWallNs = sum(func(r *VegetaBlockResult) int64 { return r.SerialWallNs })
+	avg.SerialSumNs = sum(func(r *VegetaBlockResult) int64 { return r.SerialSumNs })
+	avg.MptNs = sum(func(r *VegetaBlockResult) int64 { return r.MptNs })
+	avg.BaselineWallNs = sum(func(r *VegetaBlockResult) int64 { return r.BaselineWallNs })
+	avg.BaselineSumNs = sum(func(r *VegetaBlockResult) int64 { return r.BaselineSumNs })
+	// 派生字段重算（基于平均后的基础值）
 	avg.TotalAlgoNs = avg.OrderNs + avg.DagNs + avg.ParallelWallNs + avg.SerialWallNs
 	avg.TotalInclPreNs = avg.PreExecWallNs + avg.TotalAlgoNs
 	return &avg

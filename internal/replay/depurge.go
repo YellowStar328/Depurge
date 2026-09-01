@@ -240,6 +240,9 @@ func (r *Replayer) RunDepurge(dcfg DepurgeConfig, blockRange string, runs int, w
 		totals DepurgeBlockResult
 	)
 	totals.LLMFail = make(map[string]int)
+	// CoW 物化统计窗口：覆盖本次 run 全部 blocks×runs（仅 depurge 的
+	// CloneCoW 路径计数，其他算法不触碰）。
+	state.ResetCowStats()
 	err = r.loader.ForEachBlock(blockRange, func(blk *dataset.BlockData) error {
 		// 整区块多轮：取各轮耗时平均，正确性诊断以最后一轮为准（各轮确定性一致）。
 		res, perRun, err := r.runDepurgeBlockRuns(blk, dcfg, contracts, opts, runs)
@@ -309,6 +312,13 @@ func (r *Replayer) RunDepurge(dcfg DepurgeConfig, blockRange string, runs int, w
 		time.Duration(totals.ParallelWallNs), time.Duration(totals.ParallelSumNs),
 		time.Duration(totals.CloneNs), time.Duration(totals.MergeNs),
 		depurgeAvgInFlight(&totals), totals.PeakInFlight, totals.Dispatches)
+	// CoW originStorage 整表物化测量（合并侧 / 子库 Finalise 侧）：
+	// copies=整表拷贝次数，copied-slots=被拷槽总数，writes=物化后实写槽数，
+	// 末列为拷贝耗时。放大率 ≈ copied-slots / writes。
+	cow := state.ReadCowStats()
+	fmt.Fprintf(w, "  cow-origin: merge copies=%d copied-slots=%d writes=%d (%s) | finalise copies=%d copied-slots=%d writes=%d (%s)\n",
+		cow.MergeCopies, cow.MergeCopiedSlots, cow.MergeSlotWrites, time.Duration(cow.MergeCopyNs),
+		cow.FinaliseCopies, cow.FinaliseCopiedSlots, cow.FinaliseSlotWrites, time.Duration(cow.FinaliseCopyNs))
 	fmt.Fprintf(w, "  serial    : wall=%s sum=%s\n",
 		time.Duration(totals.SerialWallNs), time.Duration(totals.SerialSumNs))
 	fmt.Fprintln(w, sep)

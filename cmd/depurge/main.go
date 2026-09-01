@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/pprof"
 
 	"github.com/spf13/cobra"
 
@@ -47,6 +48,9 @@ func main() {
 		// depurge 专属
 		dArm    string
 		dLLMDir string
+
+		// 性能分析
+		cpuProfile string
 	)
 
 	rootCmd := &cobra.Command{
@@ -58,6 +62,17 @@ func main() {
 		Use:   "replay",
 		Short: "重放 dataset 交易：串行（--replay-serial）、Vegeta 并行（--replay-vegeta）、Depurge 并行（--replay-depurge）",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cpuProfile != "" {
+				pf, err := os.Create(cpuProfile)
+				if err != nil {
+					return fmt.Errorf("create cpu profile: %w", err)
+				}
+				defer pf.Close()
+				if err := pprof.StartCPUProfile(pf); err != nil {
+					return err
+				}
+				defer pprof.StopCPUProfile()
+			}
 			if datasetDir == "" {
 				return fmt.Errorf("--dataset is required")
 			}
@@ -174,6 +189,7 @@ func main() {
 	replayCmd.Flags().StringVar(&dArm, "spec-arm", "C", "depurge step1 读写集获取臂：A=LLM 优先+回退；B=并集；C=纯预执行")
 	replayCmd.Flags().StringVar(&dLLMDir, "llm-dir", "llm/mainnet_rw", "depurge A/B 臂的 LLM 静态分析数据目录")
 	replayCmd.Flags().IntVar(&runs, "runs", 1, "每区块整管线重复轮数，串行/vegeta/depurge 共用（>1 取平均，减少测量噪声）")
+	replayCmd.Flags().StringVar(&cpuProfile, "cpuprofile", "", "写 CPU profile 到指定路径（性能分析用，可选）")
 
 	rootCmd.AddCommand(replayCmd)
 	if err := rootCmd.Execute(); err != nil {

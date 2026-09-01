@@ -588,7 +588,8 @@ func (s *MemoryStateDB) Finalise(deleteEmptyObjects bool) {
 			// 槽级 CoW：仅当确有 dirty 槽要并入 origin 时才拷贝 origin map
 			//（dirty 为空时 finalise 对 originStorage 无原地写，可免拷贝）。
 			if len(acc.dirtyStorage) > 0 {
-				s.cowEnsureOrigin(acc)
+				s.cowEnsureOrigin(acc, cowCallerFinalise)
+				cowStats.slotWrites[cowCallerFinalise].Add(uint64(len(acc.dirtyStorage)))
 			}
 			acc.finalise()
 		}

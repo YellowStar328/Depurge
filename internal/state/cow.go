@@ -2,9 +2,60 @@ package state
 
 import (
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
+
+// cowCaller 标识 cowEnsureOrigin 的调用来源，用于分侧统计物化开销。
+type cowCaller uint8
+
+const (
+	cowCallerMerge cowCaller = iota // MergeCommittedFrom 合并写槽
+	cowCallerFinalise               // Finalise 消化 dirty 槽
+	cowCallerNum                    // 哨兵：调用方种类数
+)
+
+// cowStats 汇总 originStorage 整表物化统计。仅 CloneCoW 路径（epoch≠0）
+// 计数：常规路径（深拷贝 Clone / vegeta / 串行基线）在 cowEnsureOrigin
+// 第一行即返回，绝不触碰计数器，零额外开销。
+var cowStats struct {
+	copies      [cowCallerNum]atomic.Uint64 // 整表拷贝次数
+	copiedSlots [cowCallerNum]atomic.Uint64 // 被拷 origin map 槽总数
+	slotWrites  [cowCallerNum]atomic.Uint64 // 物化后实际写入槽数（放大率分母）
+	copyNs      [cowCallerNum]atomic.Uint64 // 整表拷贝耗时总和
+}
+
+// CowStats 是 cowStats 的可读快照。
+type CowStats struct {
+	MergeCopies, MergeCopiedSlots, MergeSlotWrites, MergeCopyNs uint64
+	FinaliseCopies, FinaliseCopiedSlots, FinaliseSlotWrites     uint64
+	FinaliseCopyNs                                              uint64
+}
+
+// ReadCowStats 读取当前累计统计。
+func ReadCowStats() CowStats {
+	return CowStats{
+		MergeCopies:      cowStats.copies[cowCallerMerge].Load(),
+		MergeCopiedSlots: cowStats.copiedSlots[cowCallerMerge].Load(),
+		MergeSlotWrites:  cowStats.slotWrites[cowCallerMerge].Load(),
+		MergeCopyNs:      cowStats.copyNs[cowCallerMerge].Load(),
+		FinaliseCopies:      cowStats.copies[cowCallerFinalise].Load(),
+		FinaliseCopiedSlots: cowStats.copiedSlots[cowCallerFinalise].Load(),
+		FinaliseSlotWrites:  cowStats.slotWrites[cowCallerFinalise].Load(),
+		FinaliseCopyNs:      cowStats.copyNs[cowCallerFinalise].Load(),
+	}
+}
+
+// ResetCowStats 清零统计（测量窗口起点）。
+func ResetCowStats() {
+	for i := cowCaller(0); i < cowCallerNum; i++ {
+		cowStats.copies[i].Store(0)
+		cowStats.copiedSlots[i].Store(0)
+		cowStats.slotWrites[i].Store(0)
+		cowStats.copyNs[i].Store(0)
+	}
+}
 
 // cowEpochCounter 全局 epoch 发号器：单调递增、每次调用唯一。
 // epoch=0 保留为「CoW 禁用」哨兵（深拷贝 Clone / vegeta / 串行等常规路径）。
@@ -64,18 +115,23 @@ func (s *MemoryStateDB) cowEnsureAccount(addr common.Address) *AccountState {
 }
 
 // cowEnsureOrigin 确保 acc.originStorage 为 s 私有（原地写前调用）：
-// epoch 不匹配则整 map 拷贝（槽级 CoW）。epoch=0 时恒 no-op。
-func (s *MemoryStateDB) cowEnsureOrigin(acc *AccountState) {
+// epoch 不匹配则整 map 拷贝（槽级 CoW）。epoch=0 时恒 no-op，且不触碰
+// 统计计数器（常规路径零开销）。caller 标识调用来源，仅用于开销测量。
+func (s *MemoryStateDB) cowEnsureOrigin(acc *AccountState, caller cowCaller) {
 	epoch := s.epoch.Load()
 	if epoch == 0 || acc.originMatEpoch == epoch {
 		return
 	}
+	start := time.Now()
 	m := make(map[common.Hash]common.Hash, len(acc.originStorage))
 	for k, v := range acc.originStorage {
 		m[k] = v
 	}
 	acc.originStorage = m
 	acc.originMatEpoch = epoch
+	cowStats.copies[caller].Add(1)
+	cowStats.copiedSlots[caller].Add(uint64(len(m)))
+	cowStats.copyNs[caller].Add(uint64(time.Since(start).Nanoseconds()))
 }
 
 // adoptAccount 将 acc 收编为 s 私有（打当前 epoch 戳）并放入 map。

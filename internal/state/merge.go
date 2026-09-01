@@ -152,8 +152,9 @@ func (s *MemoryStateDB) MergeCommittedFrom(src *MemoryStateDB, writeKeys []strin
 		// CoW 物化（账户级 + 槽级）：originStorage 可能与存活子库共享，
 		// 原地写单槽前必须整 map 私有化。深拷贝路径（epoch=0）恒 no-op。
 		mAcc = s.cowEnsureAccount(sk.addr)
-		s.cowEnsureOrigin(mAcc)
+		s.cowEnsureOrigin(mAcc, cowCallerMerge)
 		mAcc.originStorage[sk.slot] = sAcc.GetState(sk.slot)
+		cowStats.slotWrites[cowCallerMerge].Add(1)
 	}
 	return nil
 }
