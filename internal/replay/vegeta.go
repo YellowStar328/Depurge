@@ -444,10 +444,13 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 
 	sep := "-------------------------------------------------------------------"
 	fmt.Fprintln(w, sep)
-	fmt.Fprintf(w, "blocks=%d txs=%d | waves=%d | parallel=%d (%.1f%%) serial=%d (%.1f%%)\n",
+	fmt.Fprintf(w, "blocks=%d txs=%d | waves=%d | parallel=%d (%.1f%%) aborted=%d serial=%d (%.1f%%)\n",
 		blocks, totals.TxCount, totals.Waves, totals.Committed,
-		pctOf(totals.Committed, totals.TxCount), totals.SerialTotal,
+		pctOf(totals.Committed, totals.TxCount), totals.Aborted, totals.SerialTotal,
 		pctOf(totals.SerialTotal, totals.TxCount))
+	fmt.Fprintf(w, "re-execution rate: %.2f%% (aborted %d / scheduled %d)\n",
+		pctOf(totals.Aborted, totals.Committed+totals.Aborted),
+		totals.Aborted, totals.Committed+totals.Aborted)
 	fmt.Fprintf(w, "phase timing:\n")
 	fmt.Fprintf(w, "  pre-exec  : wall=%s sum=%s (excluded from total)\n",
 		time.Duration(totals.PreExecWallNs), time.Duration(totals.PreExecSumNs))

@@ -304,7 +304,8 @@ block 24000000: 232 txs | waves=18(max 144) | parallel=215 aborted=4 serial=17 |
   abort: tx#231: nonce too high: ...
   diff: veg-only acct:0x...:balance
 -------------------------------------------------------------------
-blocks=1 txs=232 | waves=18 | parallel=215 (92.7%) serial=17 (7.3%)
+blocks=1 txs=232 | waves=18 | parallel=215 (92.7%) aborted=4 serial=17 (7.3%)
+re-execution rate: 1.83% (aborted 4 / scheduled 219)
 phase timing:
   pre-exec  : wall=17.912958ms sum=30.994449ms (excluded from total)
   order     : 378.7µs
@@ -327,6 +328,7 @@ serialized-order verification     : MATCH (diff keys 0, verified outside algo ti
 - `dag`：冲突 DAG 构建
 - `parallel`：波次乐观并行验证（`clone` 为状态克隆分项，`merge` 为合并提交分项）
 - `serial`：串行兜底重放
+- `re-execution rate`（重执行率）：`aborted / (committed + aborted)`，与 depurge 同口径（预执行失败/空集不计入）
 - `total`：`order + dag + parallel + serial`（算法总时间，**不含预执行**）
 - `state diff keys`：最终状态与串行基线不一致的 key 数（正确性诊断，`veg-only`/`serial-only` 为差异样本）
 - `serialized-order`：合并提交层等价性验证（`MATCH`/`MISMATCH`，见下）
