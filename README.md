@@ -310,6 +310,7 @@ phase timing:
   order     : 378.7µs
   dag       : 167.933µs
   parallel  : wall=22.8591ms sum=22.056458ms (clone=127.60149ms merge=1.730192ms)
+  cow-origin: merge copies=800 copied-slots=15000 writes=3200 (1.2ms) | finalise copies=900 copied-slots=16000 writes=7800 (1.5ms)
   serial    : wall=634.15µs sum=611.125µs
 -------------------------------------------------------------------
 total (order+dag+parallel+serial) : 24.039883ms
@@ -330,7 +331,7 @@ serialized-order verification     : MATCH (diff keys 0, verified outside algo ti
 - `state diff keys`：最终状态与串行基线不一致的 key 数（正确性诊断，`veg-only`/`serial-only` 为差异样本）
 - `serialized-order`：合并提交层等价性验证（`MATCH`/`MISMATCH`，见下）
 
-其中 `clone` 为所有 worker 克隆耗时**之和**（总和口径），而 `parallel wall` 为并发覆盖后的墙钟（墙钟口径），故 `clone` 可能大于 `parallel wall`——这正是「全状态 Clone 实现最新视图」的实现开销，真实系统用 MVCC 规避。
+其中 `clone` 为所有 worker 克隆耗时**之和**（总和口径），而 `parallel wall` 为并发覆盖后的墙钟（墙钟口径）。预执行与波次重执行均使用 CoW 惰性克隆（`CloneCoW`：克隆只拷指针，写时才物化被写账户），故 `clone` 很小；`cow-origin` 行进一步测量 CoW 槽级整表物化的残余开销（`copies`=整表拷贝次数、`copied-slots`=被拷槽总数、`writes`=物化后实写槽数，放大率 ≈ copied-slots / writes），分合并侧与成员库 Finalise 侧统计。并行段结束后 `DisableCoW`，串行兜底回到原地写。
 
 ### Depurge 算法输出（`--replay-depurge`）
 
@@ -349,6 +350,7 @@ phase timing:
   spec      : wall=72.673417ms (excluded from total; pre-exec sum=105.580245ms)
   graph     : 208.292µs
   parallel  : wall=162.521542ms sum=64.88024ms (clone=618.90525ms merge=137.182337ms) avg-par=51.89 peak=95 dispatches=105
+  cow-origin: merge copies=9600 copied-slots=176000 writes=36500 (8.7ms) | finalise copies=9700 copied-slots=181000 writes=88000 (9.5ms)
   serial    : wall=2.960375ms sum=2.872209ms
 -------------------------------------------------------------------
 total (graph+parallel+serial) : 165.690209ms

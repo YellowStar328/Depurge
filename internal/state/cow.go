@@ -17,7 +17,7 @@ const (
 )
 
 // cowStats 汇总 originStorage 整表物化统计。仅 CloneCoW 路径（epoch≠0）
-// 计数：常规路径（深拷贝 Clone / vegeta / 串行基线）在 cowEnsureOrigin
+// 计数：常规路径（深拷贝 Clone / 串行基线）在 cowEnsureOrigin
 // 第一行即返回，绝不触碰计数器，零额外开销。
 var cowStats struct {
 	copies      [cowCallerNum]atomic.Uint64 // 整表拷贝次数
@@ -58,12 +58,12 @@ func ResetCowStats() {
 }
 
 // cowEpochCounter 全局 epoch 发号器：单调递增、每次调用唯一。
-// epoch=0 保留为「CoW 禁用」哨兵（深拷贝 Clone / vegeta / 串行等常规路径）。
+// epoch=0 保留为「CoW 禁用」哨兵（深拷贝 Clone / 串行等常规路径）。
 var cowEpochCounter atomic.Uint64
 
 func nextCowEpoch() uint64 { return cowEpochCounter.Add(1) }
 
-// CloneCoW 是 depurge 并行阶段使用的 CoW 惰性克隆：浅拷贝 accounts map
+// CloneCoW 是 depurge/vegeta 并行阶段使用的 CoW 惰性克隆：浅拷贝 accounts map
 //（新 map + 复制 *AccountState 指针），真正写时才物化被写账户。
 //
 // epoch 协议（无引用计数、无生命周期管理、GC 安全）：
@@ -77,8 +77,9 @@ func nextCowEpoch() uint64 { return cowEpochCounter.Add(1) }
 // 仅支持纯内存模式（trieDB==nil）：带 trie 模式 storageTrie 共享且有原地
 // Update 路径，CoW 前提不成立。
 //
-// 并发：多个 worker 可在同一父库上并发调用（depurge 的 RLock 段）。期间
-// accounts map 只读（合并持写锁互斥），epoch 经全局原子计数器发号，安全。
+// 并发：多个 worker 可在同一父库上并发调用（depurge 的 RLock 段；vegeta 的
+// 波内并发克隆——波内 master 只读、合并在波间单线程）。期间 accounts map
+// 只读（depurge 合并持写锁互斥），epoch 经全局原子计数器发号，安全。
 func (s *MemoryStateDB) CloneCoW() *MemoryStateDB {
 	if s.trieDB != nil {
 		panic("CloneCoW 仅支持纯内存模式（无 trie）")
@@ -147,9 +148,9 @@ func (s *MemoryStateDB) adoptAccount(addr common.Address, acc *AccountState) {
 // 不再触发账户级/槽级物化。
 //
 // 安全契约：仅允许在「已无任何存活子库观察者」时调用（depurge 并行段
-// wg.Wait() 之后、串行兜底之前）——此时对共享账户的写无人可观察，
-// 原地写回到 epoch=0 常规路径（深拷贝 Clone / vegeta / 串行基线同构），
-// 只改写入方式、不改写入值。
+// wg.Wait() 之后 / vegeta 全部波次合并完之后，串行兜底之前）——此时对
+// 共享账户的写无人可观察，原地写回到 epoch=0 常规路径（深拷贝 Clone /
+// 串行基线同构），只改写入方式、不改写入值。
 //
 // 自愈：下一次 CloneCoW 会重新发号，matEpoch 不匹配的账户在被写前
 // 自动重新物化，本调用不为未来 CoW 留任何隐患。

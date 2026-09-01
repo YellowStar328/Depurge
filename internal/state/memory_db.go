@@ -56,7 +56,7 @@ type MemoryStateDB struct {
 	stateTrie *trie.Trie
 
 	// CoW epoch（原子访问：多 worker 并发 CloneCoW 同一父库时会写）：
-	// 0 = CoW 禁用（深拷贝 Clone / vegeta / 串行等常规路径，零额外开销）；
+	// 0 = CoW 禁用（深拷贝 Clone / 串行等常规路径，零额外开销）；
 	// 非 0 = CloneCoW 活跃，写入口须先物化共享账户（协议见 cow.go）。
 	epoch atomic.Uint64
 }

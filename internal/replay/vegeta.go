@@ -142,7 +142,7 @@ type waveOutcome struct {
 	txIdx   int
 	valid   bool                 // 验证通过
 	execNs  int64                // ApplyMessage 耗时
-	cloneNs int64                // master.Clone 耗时
+	cloneNs int64                // master.CloneCoW 耗时
 	db      *state.MemoryStateDB // valid 时：成员库（已 Finalise）
 	// writeKeys：valid 时原始扁平写集（合并提交用）
 	// additiveDeltas：可交换累加地址（coinbase）的本笔增量（成员最终 balance
@@ -225,7 +225,8 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 
 	// ---- 阶段 4：按波次乐观并行验证 ----
 	// master 即基准状态库：预执行结束后 base 不再被并发读取；
-	// 波内仅只读（并发 Clone），波间串行合并提交。
+	// 波内仅只读（并发 CloneCoW），波间串行合并提交（master 的 CoW 保持开启，
+	// 合并写先物化、不碰仍被成员库观察的共享账户，见 state/cow.go）。
 	// waveCommitted 记录每个波次 committed 交易的原始索引（波内按提交顺序），
 	// 用于"按波次隔离串行"验证（不计入算法耗时）：复刻并发读隔离 + 顺序合并。
 	master := base
@@ -287,6 +288,11 @@ func (r *Replayer) RunVegetaBlock(blk *dataset.BlockData, vcfg VegetaConfig) (*V
 		waveCommitted = append(waveCommitted, committed)
 	}
 	res.ParallelWallNs = time.Since(parStart).Nanoseconds()
+
+	// 并行段结束（所有波次成员库已合并/丢弃、无存活子库观察者）：
+	// 关闭 CoW（epoch 归零），串行兜底段的写全部原地进行，
+	// 不再有账户级/槽级物化税；下一区块的 CloneCoW 会重新发号自愈。
+	master.DisableCoW()
 
 	// ---- 阶段 5：串行重放兜底 ----
 	// 初始串行段（预执行失败/空集）+ 验证作废（不级联）；
@@ -382,6 +388,9 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 	fmt.Fprintf(w, "Vegeta run | parallelism=%d runs=%d\n",
 		vcfg.Parallelism, runs)
 
+	// CoW 物化统计窗口：覆盖本次 run 全部 blocks×runs（vegeta 的 CloneCoW 路径）。
+	state.ResetCowStats()
+
 	var (
 		blocks int
 		totals VegetaBlockResult
@@ -447,6 +456,12 @@ func (r *Replayer) RunVegeta(vcfg VegetaConfig, blockRange string, runs int, w i
 	fmt.Fprintf(w, "  parallel  : wall=%s sum=%s (clone=%s merge=%s)\n",
 		time.Duration(totals.ParallelWallNs), time.Duration(totals.ParallelSumNs),
 		time.Duration(totals.CloneNs), time.Duration(totals.MergeNs))
+	// CoW originStorage 整表物化测量（合并侧 / 波次成员 Finalise 侧），
+	// 与 depurge 同口径：放大率 ≈ copied-slots / writes。
+	cow := state.ReadCowStats()
+	fmt.Fprintf(w, "  cow-origin: merge copies=%d copied-slots=%d writes=%d (%s) | finalise copies=%d copied-slots=%d writes=%d (%s)\n",
+		cow.MergeCopies, cow.MergeCopiedSlots, cow.MergeSlotWrites, time.Duration(cow.MergeCopyNs),
+		cow.FinaliseCopies, cow.FinaliseCopiedSlots, cow.FinaliseSlotWrites, time.Duration(cow.FinaliseCopyNs))
 	fmt.Fprintf(w, "  serial    : wall=%s sum=%s\n",
 		time.Duration(totals.SerialWallNs), time.Duration(totals.SerialSumNs))
 	fmt.Fprintln(w, sep)
@@ -475,9 +490,11 @@ func (r *Replayer) vegetaPreconditions() error {
 }
 
 // vegetaPreExecute 阶段 1：多核并行预执行。
-// 每笔交易基于同一份 witness 基准状态的独立克隆执行（skipNonce=true、
+// 每笔交易基于同一份 witness 基准状态的独立 CoW 惰性克隆执行（skipNonce=true、
 // 每笔满额 GasPool），互不影响；recorder 采集保守读写集。
-// base 在本阶段并发只读（Clone 无写），预执行结果不回写 base。
+// base 在本阶段并发只读（CloneCoW 只读 accounts map + 原子发号），
+// 预执行结果不回写 base；克隆执行完即丢弃，写只物化实际写到的账户
+// （账户级 CoW），无全量深拷贝税。
 func (r *Replayer) vegetaPreExecute(blk *dataset.BlockData, base *state.MemoryStateDB,
 	blockCtx vm.BlockContext, workers int, opts vegeta.Options) ([]preExecResult, int64, int64) {
 
@@ -498,7 +515,7 @@ func (r *Replayer) vegetaPreExecute(blk *dataset.BlockData, base *state.MemorySt
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			db := base.Clone()
+			db := base.CloneCoW()
 			gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
 			out := r.executeTx(db, blockCtx, gp, &blk.Transactions[i], i, true)
 
@@ -535,10 +552,12 @@ func (r *Replayer) vegetaPreExecute(blk *dataset.BlockData, base *state.MemorySt
 	return results, time.Since(start).Nanoseconds(), sumNs
 }
 
-// vegetaRunWave 阶段 4 单个波次：批内交易在 master.Clone()（基准 + 之前已提交
+// vegetaRunWave 阶段 4 单个波次：批内交易在 master.CloneCoW()（基准 + 之前已提交
 // 交易写入的最新视图）上并行重执行，随后做读写集包含性验证。
 // 批内成员两两无边（无冲突 key 交集），互不读对方写入；
-// master 在波内只读（并发 Clone 安全），合并提交发生在波间（单线程）。
+// master 在波内只读（并发 CloneCoW 安全：accounts map 只读 + 原子发号），
+// 合并提交发生在波间（单线程，master 的 CoW 仍开启，合并写先物化、
+// 不碰仍被存活成员库观察的账户）。
 func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemoryStateDB,
 	blockCtx vm.BlockContext, wave []int, pre []preExecResult,
 	workers int, opts vegeta.Options) []*waveOutcome {
@@ -564,16 +583,18 @@ func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemorySta
 			}()
 
 			cloneStart := time.Now()
-			db := master.Clone()
+			db := master.CloneCoW()
 			oc.cloneNs = time.Since(cloneStart).Nanoseconds()
 
 			// 记录可交换累加地址（coinbase）在克隆时点的基准余额：
 			// 验证通过后 delta = 成员最终值 − 该基准（MergeCommittedFrom 增量契约）。
+			// 立即值拷贝：GetBalance 返回 master 内部共享账户的指针，
+			// CoW 下该对象与本波所有成员库共享，波间合并的加法提交会原地改它。
 			var cbAddr common.Address
 			var preAdditiveBalance *uint256.Int
 			if opts.FilterCoinbase && opts.Coinbase != "" {
 				cbAddr = common.HexToAddress(opts.Coinbase)
-				preAdditiveBalance = master.GetBalance(cbAddr)
+				preAdditiveBalance = new(uint256.Int).Set(master.GetBalance(cbAddr))
 			}
 
 			gp := new(core.GasPool).AddGas(uint64(blk.Header.GasLimit))
@@ -610,7 +631,7 @@ func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemorySta
 				} else {
 					// 通过：Finalise 消化成员状态（journal/EIP-158/自毁），
 					// 交由 MergeCommittedFrom 字段级合并进 master；
-					// 失败路径直接丢弃成员库（Clone 天然回退，无需显式回滚）。
+					// 失败路径直接丢弃成员库（CoW 克隆天然回退：master 从未被写）。
 					db.Finalise(true)
 					oc.valid = true
 					oc.db = db
@@ -635,7 +656,8 @@ func (r *Replayer) vegetaRunWave(blk *dataset.BlockData, master *state.MemorySta
 // （MergeCommittedFrom / additiveDeltas / nonce 累加）是否与串行重放等价。
 //
 // 口径：按波次分批。每个波次内，每笔交易基于"波次开始时的 db 快照"独立执行
-// （复刻并发时每笔 master.Clone() 的读隔离——同波交易互相不可见），波内全部
+// （复刻并发时每笔 master.CloneCoW() 的读隔离——同波交易互相不可见；
+// 此处用深拷贝 Clone 做等价复刻，快照语义相同），波内全部
 // 执行完后按 committed 顺序 MergeCommittedFrom 合并进 db（复刻并发合并）。
 // 串行兜底段（serialList）在 db 上直接顺序执行（与并发串行段一致）。
 // nonce 口径逐笔匹配：并行段交易 skipNonce=true，串行兜底段 skipNonce=false。
@@ -654,7 +676,7 @@ func (r *Replayer) vegetaSerializedOrderReplay(blk *dataset.BlockData, blockCtx 
 
 	// 并行段：按波次隔离串行（复刻并发读隔离 + 顺序合并）
 	for _, wave := range waveCommitted {
-		// 波次开始快照：本波所有交易的执行基准（复刻并发 master.Clone()）
+		// 波次开始快照：本波所有交易的执行基准（复刻并发 master.CloneCoW()）
 		waveSnapshot := db.Clone()
 
 		type mergeRec struct {
