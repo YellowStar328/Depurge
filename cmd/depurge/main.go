@@ -22,16 +22,17 @@ import (
 
 func main() {
 	var (
-		datasetDir     string
-		outputDir      string
-		blocks         string
-		runs           int
-		compare        bool
-		noRecord       bool
-		granularity    string
-		collectBalance bool
-		collectNonce   bool
-		mptPerTx       bool
+		datasetDir      string
+		outputDir       string
+		blocks          string
+		runs            int
+		compare         bool
+		noRecord        bool
+		granularity     string
+		collectBalance  bool
+		collectNonce    bool
+		mptPerTx        bool
+		dropCoinbaseTip bool
 
 		// 算法选择开关
 		replaySerial  bool
@@ -48,6 +49,7 @@ func main() {
 		// depurge 专属
 		dArm    string
 		dLLMDir string
+		dDiagTx int
 
 		// 性能分析
 		cpuProfile string
@@ -90,6 +92,7 @@ func main() {
 			cfg.RecordRW = !noRecord
 			cfg.Compare = compare
 			cfg.MPTPerTx = mptPerTx
+			cfg.DropCoinbaseTip = dropCoinbaseTip
 			cfg.StateConfig = state.DefaultConfig()
 			switch granularity {
 			case "slot":
@@ -154,6 +157,7 @@ func main() {
 					FilterNonce:    vFilterNonce,
 					FilterCoinbase: vFilterCoinbase,
 					StateConfig:    cfg.StateConfig,
+					DiagTx:         dDiagTx,
 				}
 				fmt.Printf("depurge depurge: dataset=%s blocks=%s runs=%d parallelism=%s spec-arm=%s filter-nonce=%v filter-coinbase=%v\n",
 					datasetDir, blocksOrAll(blocks), runs, parallelismOrAuto(vParallelism),
@@ -175,6 +179,7 @@ func main() {
 	replayCmd.Flags().BoolVar(&collectBalance, "collect-balance", true, "采集 balance 读写")
 	replayCmd.Flags().BoolVar(&collectNonce, "collect-nonce", true, "采集 nonce 读写")
 	replayCmd.Flags().BoolVar(&mptPerTx, "mpt-per-tx", false, "MPT 提交口径：true=每笔交易提交；false=区块结束一次（默认）")
+	replayCmd.Flags().BoolVar(&dropCoinbaseTip, "drop-coinbase-tip", true, "釜底抽薪：执行后撤销 tip 对 coinbase balance 的写入（消除 WW 热点与「读 coinbase」值竞态；false 保留链上 tip 口径）")
 
 	replayCmd.Flags().BoolVar(&replaySerial, "replay-serial", true, "运行串行执行算法（EVM/MPT/receipt 耗时）")
 	replayCmd.Flags().BoolVar(&replayVegeta, "replay-vegeta", true, "运行 Vegeta 并行算法（各阶段耗时 + state-diff）")
@@ -188,10 +193,126 @@ func main() {
 
 	replayCmd.Flags().StringVar(&dArm, "spec-arm", "C", "depurge step1 读写集获取臂：A=LLM 优先+回退；B=并集；C=纯预执行")
 	replayCmd.Flags().StringVar(&dLLMDir, "llm-dir", "llm/mainnet_rw", "depurge A/B 臂的 LLM 静态分析数据目录")
+	replayCmd.Flags().IntVar(&dDiagTx, "diag-tx", -1, "depurge 诊断：追踪指定交易 idx 的执行时序/读写集，输出 [diag] 行（分析非确定性用）")
 	replayCmd.Flags().IntVar(&runs, "runs", 1, "每区块整管线重复轮数，串行/vegeta/depurge 共用（>1 取平均，减少测量噪声）")
 	replayCmd.Flags().StringVar(&cpuProfile, "cpuprofile", "", "写 CPU profile 到指定路径（性能分析用，可选）")
 
 	rootCmd.AddCommand(replayCmd)
+
+	// specdiff：第二臂（A/B）vs C 臂（预执行）逐合约 abort 动态对比（分析工具，输出到 stdout）。
+	var (
+		sdDataset        string
+		sdBlocks         string
+		sdLLMDir         string
+		sdArm            string
+		sdParallelism    int
+		sdFilterNonce    bool
+		sdFilterCoinbase bool
+		sdMinTx          int
+		sdTop            int
+		sdAll            bool
+	)
+	specDiffCmd := &cobra.Command{
+		Use:   "specdiff",
+		Short: "第二臂（A=LLM 优先 / B=并集）vs C 臂（预执行）逐合约 abort 对比：筛出换臂能降低 abort 的合约",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if sdDataset == "" {
+				return fmt.Errorf("--dataset is required")
+			}
+			if sdLLMDir == "" {
+				return fmt.Errorf("--llm-dir is required")
+			}
+			loader, err := dataset.NewLoader(sdDataset)
+			if err != nil {
+				return err
+			}
+			cfg := replay.DefaultConfig()
+			cfg.Runs = 1
+			cfg.RecordRW = true
+			cfg.StateConfig = state.DefaultConfig()
+			r := replay.NewReplayer(loader, cfg)
+			sdcfg := replay.SpecDiffConfig{
+				Parallelism:    sdParallelism,
+				FilterNonce:    sdFilterNonce,
+				FilterCoinbase: sdFilterCoinbase,
+				LLMDir:         sdLLMDir,
+				Arm:            sdArm,
+				MinTx:          sdMinTx,
+				Top:            sdTop,
+				All:            sdAll,
+			}
+			fmt.Printf("depurge specdiff: dataset=%s blocks=%s llm-dir=%s arm=%s parallelism=%s filter-nonce=%v filter-coinbase=%v\n",
+				sdDataset, blocksOrAll(sdBlocks), sdLLMDir, sdArm, parallelismOrAuto(sdParallelism),
+				sdFilterNonce, sdFilterCoinbase)
+			return r.RunSpecDiff(sdcfg, sdBlocks, os.Stdout)
+		},
+	}
+	specDiffCmd.Flags().StringVar(&sdDataset, "dataset", "", "dataset 目录路径（必填）")
+	specDiffCmd.Flags().StringVar(&sdBlocks, "blocks", "", "区块范围过滤，如 21498700-21498710（默认全部）")
+	specDiffCmd.Flags().StringVar(&sdLLMDir, "llm-dir", "llm/mainnet_rw", "LLM 静态分析数据目录")
+	specDiffCmd.Flags().StringVar(&sdArm, "arm", "A", "第二臂：A=LLM 优先+回退；B=并集（基线恒为 C=纯预执行）")
+	specDiffCmd.Flags().IntVar(&sdParallelism, "parallelism", 0, "预执行 worker 数（<=0 = runtime.NumCPU()）")
+	specDiffCmd.Flags().BoolVar(&sdFilterNonce, "filter-nonce", true, "过滤 nonce 伪冲突 key")
+	specDiffCmd.Flags().BoolVar(&sdFilterCoinbase, "filter-coinbase", true, "过滤 coinbase 的 balance tip 写 key")
+	specDiffCmd.Flags().IntVar(&sdMinTx, "min-tx", 1, "逐合约输出的最低交易数阈值")
+	specDiffCmd.Flags().IntVar(&sdTop, "top", 20, "A 臂更差表的展示条数")
+	specDiffCmd.Flags().BoolVar(&sdAll, "all", false, "输出全部合约（含 delta=0）")
+	rootCmd.AddCommand(specDiffCmd)
+
+	// branchflip：分支翻转探测（预执行分支 vs 串行累积分支），定位「分支读写集偏移」交易。
+	var (
+		bfDataset        string
+		bfBlocks         string
+		bfLLMDir         string
+		bfContract       string
+		bfParallelism    int
+		bfFilterNonce    bool
+		bfFilterCoinbase bool
+		bfMinTotal       int
+		bfTop            int
+	)
+	branchFlipCmd := &cobra.Command{
+		Use:   "branchflip",
+		Short: "分支翻转探测：找出预执行走一个分支、串行累积后走另一个分支（读写集偏移）的交易",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if bfDataset == "" {
+				return fmt.Errorf("--dataset is required")
+			}
+			loader, err := dataset.NewLoader(bfDataset)
+			if err != nil {
+				return err
+			}
+			cfg := replay.DefaultConfig()
+			cfg.Runs = 1
+			cfg.RecordRW = true
+			cfg.StateConfig = state.DefaultConfig()
+			r := replay.NewReplayer(loader, cfg)
+			bfcfg := replay.BranchFlipConfig{
+				Parallelism:    bfParallelism,
+				FilterNonce:    bfFilterNonce,
+				FilterCoinbase: bfFilterCoinbase,
+				LLMDir:         bfLLMDir,
+				Contract:       bfContract,
+				MinTotal:       bfMinTotal,
+				Top:            bfTop,
+			}
+			fmt.Printf("depurge branchflip: dataset=%s blocks=%s contract=%s parallelism=%s filter-nonce=%v filter-coinbase=%v\n",
+				bfDataset, blocksOrAll(bfBlocks), bfContract, parallelismOrAuto(bfParallelism),
+				bfFilterNonce, bfFilterCoinbase)
+			return r.RunBranchFlip(bfcfg, bfBlocks, os.Stdout)
+		},
+	}
+	branchFlipCmd.Flags().StringVar(&bfDataset, "dataset", "", "dataset 目录路径（必填）")
+	branchFlipCmd.Flags().StringVar(&bfBlocks, "blocks", "", "区块范围过滤，如 21498700-21498710（默认全部）")
+	branchFlipCmd.Flags().StringVar(&bfLLMDir, "llm-dir", "llm/mainnet_rw", "LLM 静态分析数据目录（用于合约名）")
+	branchFlipCmd.Flags().StringVar(&bfContract, "contract", "", "只看指定合约（0x 地址）；空=全部")
+	branchFlipCmd.Flags().IntVar(&bfParallelism, "parallelism", 0, "预执行 worker 数（<=0 = runtime.NumCPU()）")
+	branchFlipCmd.Flags().BoolVar(&bfFilterNonce, "filter-nonce", true, "过滤 nonce 伪冲突 key")
+	branchFlipCmd.Flags().BoolVar(&bfFilterCoinbase, "filter-coinbase", true, "过滤 coinbase 的 balance tip 写 key")
+	branchFlipCmd.Flags().IntVar(&bfMinTotal, "min-total", 1, "上报阈值：miss+extra 总 key 数 >= 该值")
+	branchFlipCmd.Flags().IntVar(&bfTop, "top", 30, "按合约聚合表的展示条数")
+	rootCmd.AddCommand(branchFlipCmd)
+
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

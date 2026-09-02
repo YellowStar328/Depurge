@@ -14,6 +14,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
@@ -27,19 +28,31 @@ import (
 
 // Config 重放配置。
 type Config struct {
-	Runs        int  // 每笔交易执行次数（>1 时输出各次耗时与中位数）
-	RecordRW    bool // 是否采集读写集（false = 纯性能基准）
-	Compare     bool // 是否与 dataset canonical/rwsets 对比
-	MPTPerTx    bool // MPT 提交口径：true=每笔交易 CommitMPT（pre-Byzantium 语义）；false=区块结束统一一次（现代主网语义）
-	StateConfig state.Config
+	Runs            int  // 每笔交易执行次数（>1 时输出各次耗时与中位数）
+	RecordRW        bool // 是否采集读写集（false = 纯性能基准）
+	Compare         bool // 是否与 dataset canonical/rwsets 对比
+	MPTPerTx        bool // MPT 提交口径：true=每笔交易 CommitMPT（pre-Byzantium 语义）；false=区块结束统一一次（现代主网语义）
+	DropCoinbaseTip bool // 釜底抽薪：执行后撤销 tip 对 coinbase balance 的写入（消除 WW 热点与「读 coinbase」值竞态；代价是 coinbase 恒为初值，与链上口径偏离）
+	StateConfig     state.Config
+}
+
+// txTiming 记录单笔交易的耗时定位信息，用于统计最短/最长交易。
+type txTiming struct {
+	block   uint64
+	idx     int
+	hash    string
+	to      string
+	gas     uint64
+	elapsed int64
 }
 
 // DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
 	return Config{
-		Runs:        1,
-		RecordRW:    true,
-		StateConfig: state.DefaultConfig(),
+		Runs:            1,
+		RecordRW:        true,
+		DropCoinbaseTip: true,
+		StateConfig:     state.DefaultConfig(),
 	}
 }
 
@@ -48,6 +61,7 @@ type Replayer struct {
 	loader      *dataset.Loader
 	cfg         Config
 	chainConfig *params.ChainConfig
+	diag        *depurgeDiag // depurge 非确定性诊断（--diag-tx；每区块重置）
 }
 
 // NewReplayer 创建重放器。chainId 来自 manifest，使用主网 ChainConfig 语义。
@@ -108,6 +122,10 @@ func (r *Replayer) RunSerial(w *output.Writer, sum io.Writer, blockRange string,
 		totalMptNs     int64 // MPT 树更新
 		totalReceiptNs int64 // receipt 构建
 	)
+
+	// 最短/最长交易跟踪（按 EVM 执行耗时 ElapsedNs 排序，取前若干笔展示）。
+	const timingSample = 5
+	var shortest, longest []txTiming
 	err := r.loader.ForEachBlock(blockRange, func(blk *dataset.BlockData) error {
 		// 每区块跑 runs 轮，三段耗时取平均；JSONL 只写最后一轮（确定性一致）。
 		var blockSerialNs, blockMptNs, blockReceiptNs int64
@@ -135,6 +153,22 @@ func (r *Replayer) RunSerial(w *output.Writer, sum io.Writer, blockRange string,
 			return err
 		}
 
+		// 采集本区块每笔交易的耗时样本，用于全局最短/最长交易统计。
+		for i := range results {
+			tt := txTiming{
+				block:   blk.BlockNumber(),
+				idx:     results[i].TxIndex,
+				hash:    results[i].TxHash.Hex(),
+				gas:     results[i].GasUsed,
+				elapsed: results[i].ElapsedNs,
+			}
+			if i < len(blk.Transactions) {
+				tt.to = blk.Transactions[i].To
+			}
+			shortest = insertTiming(shortest, tt, timingSample, true)
+			longest = insertTiming(longest, tt, timingSample, false)
+		}
+
 		totalSerialNs += blockSerialNs
 		totalMptNs += blockMptNs
 		totalReceiptNs += blockReceiptNs
@@ -159,6 +193,19 @@ func (r *Replayer) RunSerial(w *output.Writer, sum io.Writer, blockRange string,
 	fmt.Fprintf(bw, "Chain-equivalent  : %s (EVM+MPT+receipt)\n", time.Duration(chainTotal))
 	fmt.Fprintf(bw, "Serial exec only  : %s (EVM only)\n", time.Duration(totalSerialNs))
 	fmt.Fprintf(bw, "Total elapsed     : %s\n", time.Since(startTime))
+
+	// 最短/最长交易明细（EVM 执行耗时口径，跨全部区块）。
+	fmt.Fprintf(bw, "%s\n", sub)
+	fmt.Fprintf(bw, "Fastest txs (top %d by EVM exec):\n", len(shortest))
+	for _, tt := range shortest {
+		fmt.Fprintf(bw, "  blk %d tx#%d gas=%d | %s | %s | %s\n",
+			tt.block, tt.idx, tt.gas, time.Duration(tt.elapsed), tt.hash, tt.to)
+	}
+	fmt.Fprintf(bw, "Slowest txs (top %d by EVM exec):\n", len(longest))
+	for _, tt := range longest {
+		fmt.Fprintf(bw, "  blk %d tx#%d gas=%d | %s | %s | %s\n",
+			tt.block, tt.idx, tt.gas, time.Duration(tt.elapsed), tt.hash, tt.to)
+	}
 	fmt.Fprintf(bw, "%s\n", sep)
 
 	return nil
@@ -335,6 +382,12 @@ func (r *Replayer) executeTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 	}
 	db.SetTxContext(common.HexToHash(tx.Hash), txIdx)
 
+	// DropCoinbaseTip 基准：执行前 coinbase 余额（循环结束后撤销 tip 写回此值）。
+	var cbPre *uint256.Int
+	if r.cfg.DropCoinbaseTip && blockCtx.Coinbase != (common.Address{}) {
+		cbPre = new(uint256.Int).Set(db.GetBalance(blockCtx.Coinbase))
+	}
+
 	out.runs = make([]int64, 0, r.cfg.Runs)
 	for run := 0; run < r.cfg.Runs; run++ {
 		isLast := run == r.cfg.Runs-1
@@ -374,6 +427,17 @@ func (r *Replayer) executeTx(db *state.MemoryStateDB, blockCtx vm.BlockContext,
 		out.result, out.execErr = result, execErr
 		*gp = gpCopy
 		out.recorder = rec
+	}
+
+	// 釜底抽薪：撤销 tip 对 coinbase balance 的写入（写回执行前基准值）。
+	// 在 ApplyMessage 之后、返回之前执行：串行/预执行/vegeta/depurge 全口径统一，
+	// 使 coinbase balance 恒为初值 → 无 WW 热点、无「读 coinbase」值竞态。
+	// 走 AddBalance(delta) 而非直接改字段：保持 journal/recorder 口径一致。
+	if cbPre != nil {
+		cur := db.GetBalance(blockCtx.Coinbase)
+		if delta := new(uint256.Int).Sub(cbPre, cur); !delta.IsZero() {
+			db.AddBalance(blockCtx.Coinbase, delta, tracing.BalanceChangeUnspecified)
+		}
 	}
 	return out
 }
@@ -556,6 +620,34 @@ func buildReceipt(blk *dataset.BlockData, txIdx int, logs []*types.Log, result *
 	// 计算 bloom（链上 MakeReceipt 的大头）
 	receipt.Bloom = types.CreateBloom(receipt)
 	return receipt
+}
+
+// insertTiming 维护一个长度上限为 limit 的有序切片：ascending=true 时保留
+// elapsed 最小的 limit 个，否则保留最大的 limit 个。返回更新后的切片。
+func insertTiming(s []txTiming, t txTiming, limit int, ascending bool) []txTiming {
+	if limit <= 0 {
+		return s
+	}
+	if len(s) < limit {
+		s = append(s, t)
+	} else if (ascending && t.elapsed < s[len(s)-1].elapsed) ||
+		(!ascending && t.elapsed > s[len(s)-1].elapsed) {
+		s[len(s)-1] = t
+	} else {
+		return s
+	}
+	// 按 elapsed 排序（ascending：升序；否则降序）
+	for i := len(s) - 1; i > 0; i-- {
+		less := s[i].elapsed < s[i-1].elapsed
+		if !ascending {
+			less = s[i].elapsed > s[i-1].elapsed
+		}
+		if !less {
+			break
+		}
+		s[i], s[i-1] = s[i-1], s[i]
+	}
+	return s
 }
 
 func median(v []int64) int64 {

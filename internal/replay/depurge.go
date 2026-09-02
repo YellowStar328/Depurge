@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -42,6 +43,13 @@ type DepurgeConfig struct {
 	FilterNonce    bool         // 调度/验证过滤 nonce 伪冲突 key
 	FilterCoinbase bool         // 过滤 coinbase 的 balance tip 写 key（可交换累加；合并走增量）
 	StateConfig    state.Config // recorder 采集配置（取自 Replayer.cfg，仅文档提示）
+	// SkipBaseline 跳过串行基线与 state-diff 诊断（仅分析场景用，
+	// 如 specdiff 双臂对比：基线不影响 abort 统计，省去整块串行重放开销）。
+	SkipBaseline bool
+	// DiagTx 诊断追踪的交易 idx（<0 关闭）：记录 merge 事件序、每笔交易
+	// Clone 时刻的已完成合并数（可见性基准）与 focus 交易的结局/真实读写集，
+	// 用于对比复跑间成功/abort 分叉的时序差异（输出 [diag] 行到 stdout）。
+	DiagTx int
 }
 
 // DefaultDepurgeConfig 返回默认配置：C 臂（纯预执行）、多核、
@@ -115,6 +123,81 @@ type DepurgeBlockResult struct {
 	StateDiffSample []string // 不一致 key 样本（前若干个）
 	FailSamples     []string // 作废原因样本（前若干个）
 	Warning         string   // 死锁防御触发等异常提示（空 = 无异常）
+
+	// TxDetails 逐笔结局（step1 分类 + step3 调度/abort），供 specdiff
+	// 逐合约归因；正常重放也填充（开销可忽略）。
+	TxDetails []TxDetail
+}
+
+// TxDetail 单笔交易在 depurge 管线中的结局（供 specdiff 逐合约归因）。
+type TxDetail struct {
+	To        string                // 目标合约地址（合约创建为空）
+	LLMOK     bool                  // LLM 实例化成功（A 臂该笔实际用 LLM 集）
+	LLMFail   depurge.LLMFailReason // LLM 失败原因（LLMOK 时为 LLMOK；C 臂不尝试 LLM，恒零值）
+	Scheduled bool                  // 进入并行调度（spec 非空）
+	Committed bool                  // 并行验证通过并提交（Scheduled 且非 Aborted 非 Degraded）
+	Aborted   bool                  // 并行段 abort（验证失败/重执行失败/兜底排空）
+	// Miss 是 rw-set violation 时 real∖spec 的缺失 key（前 missKeyCap 个；
+	// 其他作废原因为空）。缺失 key 即「该臂 spec 没覆盖到的真实读写」。
+	Miss []string
+}
+
+// missKeyCap 逐笔缺失 key 保留上限（分析用，防长尾爆量）。
+const missKeyCap = 6
+
+// depurgeDiag 事件驱动执行的非确定性诊断（--diag-tx）。
+//
+// 记录三类事件用于对比复跑分叉：
+//   - merges：dispatcher 处理序（"idx:cmt"/"idx:abt"，仅提交推进 mergeSeq）；
+//   - clones[idx]：该笔交易 Clone 时刻的 mergeSeq（= 克隆快照已含的合并数，
+//     即"看到了谁的写入"的可见性基准；每 tx 单次派发执行，单写安全）；
+//   - outcome/reals：focus 交易的结局与真实读写集（走没走不同分支）。
+type depurgeDiag struct {
+	focus    int
+	mergeSeq atomic.Int64
+	clones   []int64  // txIdx → Clone 时 mergeSeq（-1 = 未派发）
+	merges   []string // dispatcher 串行 append
+	outcome  string   // focus 结局（"commit" 或 failReason）
+	reals    []string // focus 真实读写并集（排序）
+}
+
+func (d *depurgeDiag) enabled() bool { return d != nil && d.focus >= 0 }
+
+// recordMerge 记录一次 dispatcher 完成事件；提交才推进可见性序号。
+func (d *depurgeDiag) recordMerge(idx int, committed bool) {
+	tag := "abt"
+	if committed {
+		tag = "cmt"
+		d.mergeSeq.Add(1)
+	}
+	d.merges = append(d.merges, fmt.Sprintf("%d:%s", idx, tag))
+}
+
+func (d *depurgeDiag) recordClone(idx int) {
+	if idx < len(d.clones) {
+		d.clones[idx] = d.mergeSeq.Load()
+	}
+}
+
+// report 输出诊断（并行段结束后调用）：按行结构化，便于多次运行的 diff。
+func (d *depurgeDiag) report(block uint64) {
+	if !d.enabled() {
+		return
+	}
+	outcome := d.outcome
+	if outcome == "" {
+		outcome = "(not-executed)"
+	}
+	var cs []string
+	for i, s := range d.clones {
+		if s >= 0 {
+			cs = append(cs, fmt.Sprintf("%d→%d", i, s))
+		}
+	}
+	fmt.Printf("[diag] block=%d tx#%d outcome=%q cloneSeq=%d totalMerge=%d\n", block, d.focus, outcome, d.clones[d.focus], d.mergeSeq.Load())
+	fmt.Printf("[diag] merge-order: %s\n", strings.Join(d.merges, " "))
+	fmt.Printf("[diag] cloneSeq: %s\n", strings.Join(cs, " "))
+	fmt.Printf("[diag] tx#%d real(%d): %s\n", d.focus, len(d.reals), strings.Join(d.reals, " "))
 }
 
 // depurgeJob 是 dispatcher 派发给 worker 的单笔执行任务。
@@ -136,6 +219,8 @@ type depurgeExecResult struct {
 	// 必须在执行时基于克隆基准预计算，不能在合并时重算）。
 	writeKeys      []string
 	additiveDeltas map[common.Address]*big.Int
+	// missKeys：rw-set violation 时 real∖spec 的缺失 key（前 missKeyCap 个）。
+	missKeys []string
 }
 
 // RunDepurgeBlock 在单个区块上运行完整 depurge 管线。
@@ -348,6 +433,14 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 		TxCount:     len(blk.Transactions),
 		LLMFail:     make(map[string]int),
 	}
+	// 诊断重置（每区块/每轮）：clones 全 -1（directSerial 未派发保持 -1）。
+	r.diag = &depurgeDiag{
+		focus:  dcfg.DiagTx,
+		clones: make([]int64, len(blk.Transactions)),
+	}
+	for i := range r.diag.clones {
+		r.diag.clones[i] = -1
+	}
 
 	// 纯内存基准状态（witness 灌入 = 分块控制开销，单独计时，不计入算法时间）
 	loadStart := time.Now()
@@ -371,9 +464,11 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 	specs := make([][]string, n)
 	directSerial := make([]int, 0)
 	infos := make([]depurge.TxInfo, 0, n)
+	res.TxDetails = make([]TxDetail, n)
 	for i := range blk.Transactions {
 		tx := &blk.Transactions[i]
 		pr := &pre[i]
+		res.TxDetails[i].To = tx.To
 
 		// LLM 静态分析（仅 A/B 臂），失败逐类统计。
 		var llmKeys []string
@@ -381,10 +476,12 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 		if arm != depurge.ArmC {
 			res.LLMTried++
 			keys, reason := depurgeLLMKeys(contracts, tx)
+			res.TxDetails[i].LLMFail = reason
 			if reason == depurge.LLMOK {
 				llmOK = true
 				llmKeys = keys
 				res.LLMOK++
+				res.TxDetails[i].LLMOK = true
 			} else {
 				res.LLMFail[reason.String()]++
 			}
@@ -483,19 +580,29 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 			mergeErr := master.MergeCommittedFrom(er.db, er.writeKeys, er.additiveDeltas)
 			masterMu.Unlock()
 			res.MergeNs += time.Since(mergeStart).Nanoseconds()
+			if r.diag.enabled() {
+				r.diag.recordMerge(er.idx, true)
+			}
 			if mergeErr != nil {
 				close(jobsCh)
 				wg.Wait()
 				return nil, fmt.Errorf("block %d merge tx#%d: %w", blk.BlockNumber(), er.idx, mergeErr)
 			}
 			res.Committed++
+			res.TxDetails[er.idx].Committed = true
 			newly = sched.Finish(er.idx, false)
 		} else {
 			// 作废：不级联后继（后继继续基于"前驱写入缺失"视图执行，
 			// 最终状态尽力接近串行，确定性不受影响）；计入串行兜底。
 			res.Aborted++
+			if r.diag.enabled() {
+				r.diag.recordMerge(er.idx, false)
+			}
 			if len(res.FailSamples) < failSampleLimit {
 				res.FailSamples = append(res.FailSamples, fmt.Sprintf("tx#%d: %s", er.idx, er.failReason))
+			}
+			if len(er.missKeys) > 0 {
+				res.TxDetails[er.idx].Miss = er.missKeys
 			}
 			newly = sched.Finish(er.idx, true)
 		}
@@ -510,6 +617,7 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 	close(jobsCh)
 	wg.Wait()
 	res.ParallelWallNs = time.Since(parStart).Nanoseconds()
+	r.diag.report(blk.BlockNumber())
 
 	// 死锁防御兜底：队列按原始序入队，阻塞恒指向更小序号，理论不可达；
 	// 若触发则剩余 pending 强制进串行段（对齐 vegeta Degraded 语义）。
@@ -517,6 +625,22 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 		remaining := sched.DrainRemaining()
 		res.Degraded = len(remaining)
 		res.Warning = fmt.Sprintf("死锁防御触发：%d 笔 pending 交易强制进入串行段", len(remaining))
+	}
+
+	// 逐笔调度/abort 结局（供 specdiff 逐合约归因）。
+	// sched.Aborted() 已含防御兜底交易；specs[i]==nil 即 step1 直接串行。
+	abortedSet := make(map[int]struct{}, len(sched.Aborted()))
+	for _, idx := range sched.Aborted() {
+		abortedSet[idx] = struct{}{}
+	}
+	for i := range res.TxDetails {
+		if specs[i] == nil {
+			continue
+		}
+		res.TxDetails[i].Scheduled = true
+		if _, ok := abortedSet[i]; ok {
+			res.TxDetails[i].Aborted = true
+		}
 	}
 
 	// ---- step4：串行兜底（直接串行 + abort + 防御兜底，按最初顺序）----
@@ -549,28 +673,31 @@ func (r *Replayer) runDepurgeBlockOnce(blk *dataset.BlockData, dcfg DepurgeConfi
 	res.MptNs = mptNs
 
 	// ---- 串行基线（同口径纯内存）与最终状态 diff 诊断 ----
-	baselineDb, baseWall, baseSum := r.vegetaSerialBaseline(blk, blockCtx)
-	res.BaselineWallNs, res.BaselineSumNs = baseWall, baseSum
+	// SkipBaseline（specdiff 等分析场景）：基线不影响 abort 统计，省去整块串行重放。
+	if !dcfg.SkipBaseline {
+		baselineDb, baseWall, baseSum := r.vegetaSerialBaseline(blk, blockCtx)
+		res.BaselineWallNs, res.BaselineSumNs = baseWall, baseSum
 
-	onlyDep, onlyBase := state.DiffFlatStates(master.ExportFlatState(), baselineDb.ExportFlatState())
-	res.StateDiffKeys = len(onlyDep) + len(onlyBase)
-	for _, k := range onlyDep {
-		if len(res.StateDiffSample) >= stateDiffSampleLimit {
-			break
+		onlyDep, onlyBase := state.DiffFlatStates(master.ExportFlatState(), baselineDb.ExportFlatState())
+		res.StateDiffKeys = len(onlyDep) + len(onlyBase)
+		for _, k := range onlyDep {
+			if len(res.StateDiffSample) >= stateDiffSampleLimit {
+				break
+			}
+			res.StateDiffSample = append(res.StateDiffSample, "depurge-only "+k)
 		}
-		res.StateDiffSample = append(res.StateDiffSample, "depurge-only "+k)
-	}
-	for _, k := range onlyBase {
-		if len(res.StateDiffSample) >= stateDiffSampleLimit {
-			break
+		for _, k := range onlyBase {
+			if len(res.StateDiffSample) >= stateDiffSampleLimit {
+				break
+			}
+			res.StateDiffSample = append(res.StateDiffSample, "serial-only "+k)
 		}
-		res.StateDiffSample = append(res.StateDiffSample, "serial-only "+k)
 	}
 
 	// ---- 成本核算 ----
 	res.TotalAlgoNs = res.GraphNs + res.ParallelWallNs + res.SerialWallNs
 	res.TotalInclSpecNs = res.SpecWallNs + res.TotalAlgoNs
-	if res.TotalAlgoNs > 0 {
+	if !dcfg.SkipBaseline && res.TotalAlgoNs > 0 {
 		res.Speedup = float64(res.BaselineWallNs) / float64(res.TotalAlgoNs)
 	}
 	return res, nil
@@ -594,6 +721,9 @@ func (r *Replayer) depurgeExecOne(blk *dataset.BlockData, master *state.MemorySt
 	cloneStart := time.Now()
 	db := master.CloneCoW()
 	er.cloneNs = time.Since(cloneStart).Nanoseconds()
+	if r.diag.enabled() {
+		r.diag.recordClone(job.idx)
+	}
 	// 记录可交换累加地址（coinbase）在克隆时点的基准余额：
 	// 验证通过后 delta = 成员最终值 − 该基准（MergeCommittedFrom 增量契约）。
 	// 必须立即值拷贝：GetBalance 返回 master 内部账户的指针，RUnlock 后
@@ -629,6 +759,10 @@ func (r *Replayer) depurgeExecOne(blk *dataset.BlockData, master *state.MemorySt
 		miss := vegeta.SubsetOf(vegeta.FilterKeys(real, opts), job.spec)
 		if len(miss) > 0 {
 			er.failReason = fmt.Sprintf("rw-set violation: %v", previewMissKeys(miss))
+			er.missKeys = miss
+			if len(er.missKeys) > missKeyCap {
+				er.missKeys = er.missKeys[:missKeyCap]
+			}
 		} else {
 			// 通过：Finalise 消化成员状态（journal/EIP-158/自毁），
 			// 交由 MergeCommittedFrom 字段级合并进 master；
@@ -644,6 +778,19 @@ func (r *Replayer) depurgeExecOne(blk *dataset.BlockData, master *state.MemorySt
 						preAdditiveBalance.ToBig()),
 				}
 			}
+		}
+	}
+
+	// 诊断：focus 交易记录结局与真实读写集（排序）。
+	if d := r.diag; d.enabled() && job.idx == d.focus {
+		d.outcome = "commit"
+		if er.failReason != "" {
+			d.outcome = er.failReason
+		}
+		if rec := out.recorder; rec != nil {
+			real := append(append([]string{}, rec.FlatReadKeys()...), rec.FlatWriteKeys()...)
+			sort.Strings(real)
+			d.reals = real
 		}
 	}
 	return er

@@ -72,6 +72,12 @@ func TestSelectSpecArmBUnion(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("arm B llm-fail = %v, want %v", got, want)
 	}
+
+	// 预执行集为空：不入并集，即使 LLM 成功也保持空 spec
+	// （交给集成层直接串行兜底，避免 newly-scheduled 增量 abort）。
+	if got = SelectSpec(ArmB, nil, llm, true, senderBal); len(got) != 0 {
+		t.Fatalf("arm B empty pre-exec = %v, want empty spec", got)
+	}
 }
 
 func TestParseArm(t *testing.T) {

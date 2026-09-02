@@ -92,6 +92,17 @@ A/B 臂依赖 `llm/mainnet_rw`（`--llm-dir`）。LLM 只产 storage slot，桥�
 （gas 真实调度键）。LLM 失败逐类统计：`not-contract`（EOA 调用）/`no-contract`（无分析）/
 `no-selector`/`decode-fail`/`no-storage`（缺 storage 布局）/`unresolved`（含动态键）/`empty`。
 
+> **B 臂空集守卫**：`B` 臂并集仅在预执行读写集非空时并入 LLM 键。预执行集为空
+> （交易在块初态执行不动，如「先收后花」的机器人流）则保持空 spec → 直接串行兜底，
+> 与 C 臂同分类。避免把这些本应串行的交易拉进并行调度后因 LLM 静态集 recall 不足而 abort。
+> 实测（990 区块）：`newly-scheduled` 103→0、abort 增量 +92→≈0。
+
+> **coinbase tip 釜底抽薪（`--drop-coinbase-tip`，默认 true）**：执行后撤销 tip 对
+> coinbase balance 的写入。根因：`--filter-coinbase` 假设「coinbase balance 只写不读」，
+> 但存在读它做控制流分支的交易（如 MEV 套利读 builder 余额），会引发无依赖边 + 验证
+> 同口径过滤两道防线同时失效 → 读值随前序 tip 合并时序而竞态翻转 → 复跑结果非确定。
+> 撤销 tip 后 coinbase 恒为初值，竞态被剥夺影响结局的能力，复跑完全一致（state-diff 反而更小）。
+
 ```bash
 # 只跑 Depurge（C 臂 = 纯预执行读写集）
 ./depurge replay --dataset datasets/mainnet-21498532-21499531 \
@@ -105,6 +116,63 @@ A/B 臂依赖 `llm/mainnet_rw`（`--llm-dir`）。LLM 只产 storage slot，桥�
 ./depurge replay --dataset datasets/mainnet-21498532-21499531 \
   --blocks 21498532 --replay-depurge --spec-arm B --runs 5
 ```
+
+### 按合约对比 C/A 臂 abort（`specdiff` 子命令）
+
+筛选「换用 A 臂（LLM 集）后 abort 降低/升高」的合约，用于评估按合约混合选择 spec 来源
+的可行性。对同一批区块分别以 C 臂与 A 臂各跑一遍 depurge 事件驱动管线（跳过串行基线，
+不计时），逐笔记录调度/abort 并按 `tx.To` 归因聚合，输出：
+
+- 全局汇总（与 `replay --spec-arm C/A` 口径一致，可交叉核对）；
+- `delta = abortA - abortC < 0` 的合约（A 臂降低 abort 的候选）；
+- `delta > 0` 的 top N 合约（A 臂恶化最严重，`--top` 可调，`--all` 全列）。
+
+注意：两臂独立重放，无 LLM 分析的合约两臂 spec 恒同，其 ±1 级别的 delta 属调度时序
+噪声（多次运行会漂移），不是真实信号。
+
+```bash
+./depurge specdiff --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532-21498631 --parallelism 10
+```
+
+报告结构：
+
+- 全局汇总：两臂 `scheduled`/`committed`/`aborted`、`delta = abortA − abortC`、`saves`（C abort 而第二臂不 abort）/`hurts`（反之）、LLM 逐类失败统计；与 `replay --spec-arm C/A` 的 `aborted` 同口径，可交叉核对。
+- `committed delta`：并行段真正提交成功的交易数净变化，等于 `scheduled delta − abort delta`，是换臂的实际收益口径（只有 `scheduled` 变多而 `abort` 不变多才有意义）。
+- `newly scheduled`：第二臂把「C 臂 spec 过滤后为空 → 直接串行」的交易拉回并行调度的笔数，及其结局分解（`committed`=净收益 / `aborted`=白跑一次并行仍回落串行）。A/B 两臂该集合相同（都取决于「预执行空集 + LLM 非空」）。
+- `C-arm abort miss-key composition`：C 臂 abort 缺失 key 的类型分解（`storage`/`acct-balance`/`acct-other`/`other`），storage 键再做**槽反推**——若槽等于 `keccak(pad(addr) || pad(base))`（`mapping(address=>...)` 标准布局，addr 取 from/to/calldata 中的地址字、base 遍历 0..64），归为 `cracked`（分支转账对手方形态），否则 `uncracked`（计数器派生或合约内硬编码对手方）。
+- `rescued aborts`：被第二臂救回的交易样本及其 C 臂缺失 key（带反推标注）。
+- 逐合约表：按 `tx.To` 归因，`delta<0`（换臂降低 abort）/ `delta>0`（恶化，`--top` 限条数）/ `delta=0`（`--all` 才列）。列含义：`schC`/`schA`=进入并行调度，`cmtC`/`cmtA`=并行提交成功、`dCmt`=提交数净变化，`abtC`/`abtA`=并行段 abort，`delta`=abort 净变化，`saves`/`hurts`=结局翻转的交易数。
+
+### 分支翻转探测（`branchflip` 子命令）
+
+定位**分支型读写集偏移**——即 vegeta/depurge 缺点①（预执行读写集偏移 → abort → 串行退化）的根因交易。
+
+方法（确定性，不含调度噪声）：对每笔交易对比两个口径的读写集（读∪写，经同一 `--filter-nonce`/`--filter-coinbase` 过滤）：
+
+- **预执行分支**：基于区块初始状态（witness 锚点）独立执行，交易互不干扰；
+- **真实分支**（`serialRWSet`）：按区块原始顺序串行重放，基于前序交易累积后的状态（同一 `executeTx` 路径，仅状态锚点不同）。
+
+双向差异：
+
+- `miss = real ∖ pre`：真实走了、预执行没走的分支；
+- `extra = pre ∖ real`：预执行走了、真实没走的分支。
+
+**两者都非空 = 分支翻转签名**（预执行与真实落到了不同分支）。只 `miss` 非空是 abort 的充分条件（`real ⊆ spec` 验证失败），但可能只是漏了一个动态槽；`extra` 同时非空才说明整条分支换了。
+
+输出：按合约聚合表（`flips`/`missKeys`/`cracked`，`cracked` 复用 specdiff 的槽反推）+ 逐笔明细（上限 60 条，含 miss/extra 全部 key），供人工核对合约源码分支结构。
+
+```bash
+# 全量扫描（阈值：miss+extra 总 key 数 >= 2，过滤单 key 噪声）
+./depurge branchflip --dataset datasets/mainnet-21498532-21499531 \
+  --blocks 21498532-21498631 --min-total 2
+
+# 只盯一个合约
+./depurge branchflip --dataset datasets/mainnet-21498532-21499531 \
+  --contract 0xC36442b4a4522E871399CD717aBDD847Ab11FE88
+```
+
+只统计两侧都执行成功的交易（失败交易读写集无分支语义）。`--contract` 为空时统计全区块。
 
 ### 预执行 vs 串行执行读写集差异（`TestPreExecuteVsSerialRWSet`）
 
@@ -205,6 +273,8 @@ go run ./cmd/llmsoundness \
 | `--serial-order` | `block` | Vegeta 串行兜底顺序：`block`=原始区块序；`hash`=交易哈希字典序 |
 | `--filter-nonce` | `true` | 建图/验证时过滤 nonce 伪冲突 key（vegeta 与 depurge 共用） |
 | `--filter-coinbase` | `true` | 过滤 coinbase 的 balance tip 写 key（vegeta 与 depurge 共用） |
+| `--drop-coinbase-tip` | `true` | 釜底抽薪：执行后撤销 tip 对 coinbase balance 的写入（消除 WW 热点与「读 coinbase」值竞态；`false` 保留链上 tip 口径） |
+| `--diag-tx` | `-1`（关） | Depurge 诊断：追踪指定交易 idx 的执行时序/读写集，输出 `[diag]` 行到 stdout（分析非确定性用） |
 
 ## Dataset 格式
 

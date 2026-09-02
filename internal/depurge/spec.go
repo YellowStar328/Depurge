@@ -102,7 +102,9 @@ func BridgeLLMKey(k string) (string, bool) {
 // SelectSpec 按臂合并出单笔交易的最终 spec 集合（去重排序）：
 //
 //   - ArmA：llmOK 时用 LLM 集（+静态合成的 senderBal），否则回退预执行集；
-//   - ArmB：预执行集 ∪（llmOK 时 LLM 集 +senderBal）；
+//   - ArmB：预执行集 ∪（llmOK 时 LLM 集 +senderBal）；仅当预执行集非空，
+//     空预执行集（交易在块初态执行不动）不入并集，保持空 spec → 集成层
+//     直接串行兜底（与 ArmC 同分类，避免 newly-scheduled 增量 abort）；
 //   - ArmC：纯预执行集。
 //
 // senderBal 是集成层为 LLM 臂静态合成的 sender balance key
@@ -126,6 +128,9 @@ func SelectSpec(arm Arm, preKeys, llmKeys []string, llmOK bool, senderBal string
 			add(preKeys)
 		}
 	case ArmB:
+		if len(preKeys) == 0 {
+			break // 空预执行集不入并集：保持空 spec，留给串行兜底
+		}
 		add(preKeys)
 		if llmOK {
 			add(llmKeys)
